@@ -74,7 +74,11 @@ const SVG = {
   zoomout:'<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/><path d="M8 11h6"/>',
   file:   '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>',
   word:   '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M8.2 12l1.3 4 1.5-4 1.5 4 1.3-4"/>',
-  scan:   '<path d="M3 8V5a2 2 0 0 1 2-2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M21 16v3a2 2 0 0 1-2 2h-3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M7 9.5h10"/><path d="M7 13h10"/><path d="M7 16.5h6"/>'
+  scan:   '<path d="M3 8V5a2 2 0 0 1 2-2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M21 16v3a2 2 0 0 1-2 2h-3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M7 9.5h10"/><path d="M7 13h10"/><path d="M7 16.5h6"/>',
+  circle: '<circle cx="12" cy="12" r="8.5"/>',
+  arrow:  '<path d="M4 20L20 4"/><path d="M13 4h7v7"/>',
+  rub:    '<path d="M9.5 19H20"/><path d="M15.5 6.5l3 3a2 2 0 0 1 0 2.8L12 19H8l-3.2-3.2a2 2 0 0 1 0-2.8l7.9-7.9a2 2 0 0 1 2.8 0z"/>',
+  chev:   '<path d="M9 6l6 6-6 6"/>'
 };
 function ico(name, cls) {
   const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -148,7 +152,7 @@ const S = {
   annots: [], undoStack: [], redoStack: [],
   mode: 'select', sizeMode: 'match', ratioGroups: new Map(), cropping: null, sideClosed: false, overflow: 'shrink',
   fmt: { weight: null, italic: null, color: null, scale: 1 }, lastRun: null,
-  color: '#000000', fontSize: 16, fontName: 'Helvetica', strokeW: 2.5,
+  color: '#000000', fontSize: 16, fontName: 'Helvetica', strokeW: 2.5, rubberW: 14, penSeen: false, penOnly: true,
   zoom: 1, sel: null,
   pageEls: []
 };
@@ -346,24 +350,79 @@ function mountEditor() {
   const side = $('#wb-side'); side.dataset.wanted = '1'; applySidePanel();
   const acts = $('#wb-actions');
 
+  const DRAW_KIDS = [
+    { id: 'ink',     label: 'Pen',     icon: 'pen' },
+    { id: 'rect',    label: 'Box',     icon: 'rect' },
+    { id: 'ellipse', label: 'Circle',  icon: 'circle' },
+    { id: 'arrow',   label: 'Arrow',   icon: 'arrow' },
+    { id: 'rub',     label: 'Eraser',  icon: 'rub' }
+  ];
+  const DRAW_IDS = DRAW_KIDS.map(k => k.id);
   const MODES = [
     { id: 'select',   label: 'Select',    icon: 'cursor' },
     { id: 'edittext', label: 'Edit text', icon: 'retype' },
     { id: 'text',   label: 'Add text',   icon: 'type' },
     { id: 'hl',     label: 'Mark',   icon: 'hl' },
-    { id: 'ink',    label: 'Draw',   icon: 'pen' },
-    { id: 'rect',   label: 'Box',    icon: 'rect' },
+    { id: 'draw',   label: 'Draw',   icon: 'pen', kids: DRAW_KIDS },
     { id: 'picture', label: 'Edit image', icon: 'image' },
     { id: 'img',    label: 'Add image', icon: 'plus' },
-    { id: 'sign',   label: 'Sign',   icon: 'sign' },
-    { id: 'erase',  label: 'Erase',  icon: 'erase' }
+    { id: 'sign',   label: 'Sign',   icon: 'sign' }
   ];
+  let drawOpen = DRAW_IDS.includes(S.mode);
   for (const m of MODES) {
-    rail.append(h('button', {
-      class: 'trb', 'aria-pressed': S.mode === m.id, 'data-mode': m.id, title: m.label,
-      onclick: () => setMode(m.id)
-    }, ico(m.icon), h('span', null, m.label)));
+    if (!m.kids) {
+      rail.append(h('button', {
+        class: 'trb', 'aria-pressed': S.mode === m.id, 'data-mode': m.id, title: m.label,
+        onclick: () => setMode(m.id)
+      }, ico(m.icon), h('span', null, m.label)));
+      continue;
+    }
+    // the group header, and under it a drawer that slides open
+    const head = h('button', {
+      class: 'trb trb-group', 'data-group': m.id, title: m.label,
+      'aria-expanded': drawOpen, 'aria-pressed': DRAW_IDS.includes(S.mode),
+      onclick: () => {
+        if (drawOpen) {
+          /* Closing means leaving the group — otherwise syncRail, which keeps
+             the drawer open whenever a drawing tool is live, pushes it straight
+             back open and the button looks broken. */
+          drawOpen = false;
+          if (DRAW_IDS.includes(S.mode)) setMode('select');
+          else syncRail();
+        } else {
+          drawOpen = true;
+          if (!DRAW_IDS.includes(S.mode)) setMode('ink');
+          else syncRail();
+        }
+      }
+    }, ico(m.icon), h('span', null, m.label), h('span', { class: 'chev' }, ico('chev')));
+    const drawer = h('div', { class: 'subrail', 'data-drawer': m.id });
+    const inner = h('div', { class: 'subrail-in' });
+    for (const k of m.kids) {
+      inner.append(h('button', {
+        class: 'trb trb-sub', 'aria-pressed': S.mode === k.id, 'data-mode': k.id, title: k.label,
+        onclick: () => { setMode(k.id); }
+      }, ico(k.icon), h('span', null, k.label)));
+    }
+    drawer.append(inner);
+    rail.append(head, drawer);
   }
+
+  /* one place that decides what the rail looks like, so the pressed state and
+     the drawer can never drift apart */
+  function syncRail() {
+    const inGroup = DRAW_IDS.includes(S.mode);
+    if (inGroup) drawOpen = true;         // a live drawing tool is always visible
+    rail.querySelectorAll('.trb[data-mode]').forEach(b => b.setAttribute('aria-pressed', b.dataset.mode === S.mode));
+    const head = rail.querySelector('.trb-group');
+    if (head) {
+      head.setAttribute('aria-pressed', inGroup);
+      head.setAttribute('aria-expanded', drawOpen);
+    }
+    const drawer = rail.querySelector('.subrail');
+    if (drawer) drawer.classList.toggle('open', drawOpen);
+  }
+  syncRail();
 
   acts.append(
     h('button', { class: 'btn ghost sm', title: 'Undo', onclick: undo }, ico('undo')),
@@ -377,9 +436,13 @@ function mountEditor() {
   renderSidePanel();
   fitZoom();
 
+  const DRAW_MODES = ['ink', 'rect', 'ellipse', 'arrow', 'rub', 'hl', 'text'];
   function setMode(m) {
     S.mode = m;
-    rail.querySelectorAll('.trb').forEach(b => b.setAttribute('aria-pressed', b.dataset.mode === m));
+    // while a drawing tool is up the page must not pan under the pointer
+    $('#wb-stage').classList.toggle('drawing', DRAW_MODES.includes(m));
+    if (typeof syncRail === 'function') syncRail();
+    else rail.querySelectorAll('.trb').forEach(b => b.setAttribute('aria-pressed', b.dataset.mode === m));
     if (m !== 'select') select(null);
     renderSidePanel();
     for (const r of S.pageEls) {
@@ -1050,7 +1113,7 @@ function mountEditor() {
     const a = S.sel ? S.annots.find(x => x.id === S.sel) : null;
 
     if (a) {
-      side.append(h('div', { class: 'pane-h' }, 'Selected ' + ({ text: 'text', hl: 'highlight', ink: 'ink', rect: 'box', img: 'image' }[a.type] || 'object')));
+      side.append(h('div', { class: 'pane-h' }, 'Selected ' + ({ text: 'text', hl: 'highlight', ink: 'ink', rect: 'box', ellipse: 'circle', arrow: 'arrow', img: 'image' }[a.type] || 'object')));
       if (a.type === 'text') {
         side.append(field('Font', h('select', {
           onchange: e => { pushUndo(); a.font = e.target.value; repaint(); }
@@ -1129,14 +1192,15 @@ function mountEditor() {
             } }, 'Delete')));
         return;
       }
-      if (a.type === 'ink' || a.type === 'rect') side.append(sizeRow('Stroke', a.strokeW, 1, 14, v => { a.strokeW = v; repaint(); }));
+      if (['ink', 'rect', 'ellipse', 'arrow'].includes(a.type)) side.append(sizeRow('Stroke', a.strokeW, 1, 14, v => { a.strokeW = v; repaint(); }));
       if (a.type !== 'img') side.append(colorField(a.type === 'hl' ? HL_PALETTE : PALETTE, a.color, c => { pushUndo(); a.color = c; repaint(); renderSidePanel(); }));
       side.append(h('button', { class: 'btn danger sm', style: 'width:100%;justify-content:center', onclick: () => { pushUndo(); S.annots = S.annots.filter(x => x.id !== a.id); select(null); repaint(); } }, ico('trash'), 'Delete object'));
       side.append(h('p', { class: 'hint', style: 'font-size:11.5px;color:var(--ink-3);margin-top:12px' }, 'Drag to move. Use the corner handle to resize. Backspace deletes.'));
       return;
     }
 
-    const names = { select: 'Select', edittext: 'Edit text', picture: 'Edit image', text: 'Add text', hl: 'Mark', ink: 'Draw', rect: 'Box', img: 'Image', sign: 'Sign', erase: 'Erase' };
+    const names = { select: 'Select', edittext: 'Edit text', picture: 'Edit image', text: 'Add text', hl: 'Mark',
+      ink: 'Pen', rect: 'Box', ellipse: 'Circle', arrow: 'Arrow', rub: 'Eraser', img: 'Image', sign: 'Sign' };
     side.append(h('div', { class: 'pane-h' }, names[S.mode] + ' tool'));
     const tips = {
       select: 'Click an object to move or resize it.',
@@ -1145,6 +1209,9 @@ function mountEditor() {
       hl:     'Drag across a line to mark it.',
       ink:    'Draw freehand.',
       rect:   'Drag to draw a box.',
+      ellipse:'Drag to draw a circle or an oval.',
+      arrow:  'Drag from the tail to the point.',
+      rub:    'Drag over your own marks to rub them out.',
       picture:'Click a picture to lift it out, then move, crop or send it to another app.',
       img:    'Place a PNG, JPEG or WebP, then drag to size it.',
       sign:   'Draw your signature once, place it on any page.',
@@ -1155,7 +1222,7 @@ function mountEditor() {
     if (S.mode === 'edittext') {
       const edits = S.annots.filter(a => a.type === 'cover').length;
       side.append(h('p', { class: 'mono', style: 'font-size:12px;color:var(--ink-2);margin-bottom:14px' },
-        `${edits} block${edits === 1 ? '' : 's'} replaced \u00b7 build 22`));
+        `${edits} block${edits === 1 ? '' : 's'} replaced \u00b7 build 25`));
       side.append(h('div', { class: 'field' },
         h('label', null, 'Replacement size'),
         h('div', { class: 'seg' },
@@ -1242,9 +1309,26 @@ function mountEditor() {
       side.append(colorField(PALETTE, S.color, c => { S.color = c; renderSidePanel(); }));
     }
     if (S.mode === 'hl') side.append(colorField(HL_PALETTE, HL_PALETTE.includes(S.color) ? S.color : HL_PALETTE[0], c => { S.color = c; renderSidePanel(); }));
-    if (S.mode === 'ink' || S.mode === 'rect') {
+    if (S.mode === 'ink' || S.mode === 'rect' || S.mode === 'ellipse' || S.mode === 'arrow') {
       side.append(sizeRow('Stroke', S.strokeW, 1, 14, v => S.strokeW = v));
       side.append(colorField(PALETTE, S.color, c => { S.color = c; renderSidePanel(); }));
+    }
+    if (S.penSeen && ['ink', 'rect', 'ellipse', 'arrow', 'rub', 'hl'].includes(S.mode)) {
+      side.append(h('div', { class: 'field' },
+        h('label', { for: 'pen-only', style: 'display:flex;align-items:center;gap:8px;cursor:pointer' },
+          h('input', { type: 'checkbox', id: 'pen-only', checked: S.penOnly,
+            onchange: e => { S.penOnly = e.target.checked; renderSidePanel(); } }),
+          'Pencil only'),
+        h('span', { class: 'hint' }, S.penOnly
+          ? 'A finger or a resting palm scrolls the page instead of drawing.'
+          : 'A finger draws too.')));
+    }
+    if (S.mode === 'rub') {
+      side.append(sizeRow('Rubber', S.rubberW, 4, 48, v => { S.rubberW = v; renderSidePanel(); }));
+      side.append(h('p', { class: 'hint' },
+        'Pen strokes are cut exactly where you rub. A shape, a text box or a picture becomes a picture once part of it is rubbed out, so it keeps only the pixels left behind.'));
+      side.append(h('p', { class: 'hint', style: 'color:var(--mark);margin-top:8px' },
+        'It only takes away things you added. To hide something the document itself prints, draw a white Box over it.'));
     }
 
     const count = S.annots.length;
@@ -1296,6 +1380,11 @@ function mountEditor() {
     applyZoom();
     observeRender();
     stage.addEventListener('pointerdown', e => {
+      /* Only the Select tool cares about clearing the selection, and it is the
+         one place where a repaint here is harmless. With a drawing tool up this
+         fired on every stroke, repainting the layer out from under the live
+         preview — which is why the rubber stopped showing where it was. */
+      if (S.mode !== 'select') return;
       if (!e.target.closest('.an') && !e.target.closest('.handle')) select(null);
     });
   }
@@ -1332,8 +1421,11 @@ function mountEditor() {
 
   function repaint() {
     for (const r of S.pageEls) {
+      // keep whatever is mid-gesture; only the committed objects are rebuilt
+      const live = [...r.layer.querySelectorAll('.liveink, .rubring')];
       clear(r.layer);
       for (const a of S.annots.filter(x => x.page === r.pg.n)) r.layer.append(annotEl(a));
+      for (const el of live) r.layer.append(el);
     }
   }
 
@@ -1360,6 +1452,39 @@ function mountEditor() {
       n = h('div', base);
       n.style.cssText = `left:${a.x * z}px;top:${a.y * z}px;width:${a.w * z}px;height:${a.h * z}px;` +
         `border:${Math.max(1, a.strokeW * z)}px solid ${a.color};border-radius:2px`;
+    } else if (a.type === 'ellipse') {
+      n = h('div', base);
+      n.style.cssText = `left:${a.x * z}px;top:${a.y * z}px;width:${a.w * z}px;height:${a.h * z}px;` +
+        `border:${Math.max(1, a.strokeW * z)}px solid ${a.color};border-radius:50%`;
+    } else if (a.type === 'arrow' || a.type === 'erase') {
+      const b = shapeBox(a);
+      const pad = (a.type === 'erase' ? a.strokeW : Math.max(a.strokeW * 3, 10)) + 4;
+      n = h('div', base);
+      n.style.cssText = `left:${(b.x - pad) * z}px;top:${(b.y - pad) * z}px;` +
+        `width:${(b.w + pad * 2) * z}px;height:${(b.h + pad * 2) * z}px;` +
+        (a.type === 'erase' ? 'pointer-events:none' : '');
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('width', '100%'); svg.setAttribute('height', '100%');
+      svg.setAttribute('viewBox', `${b.x - pad} ${b.y - pad} ${b.w + pad * 2} ${b.h + pad * 2}`);
+      svg.setAttribute('preserveAspectRatio', 'none');
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      if (a.type === 'erase') {
+        path.setAttribute('d', a.pts.map((q, i) => (i ? 'L' : 'M') + q[0].toFixed(2) + ' ' + q[1].toFixed(2)).join(' '));
+        path.setAttribute('stroke', 'var(--mark)');
+        path.setAttribute('stroke-opacity', '0.35');
+      } else {
+        const hd = arrowHead(a);
+        path.setAttribute('d',
+          `M${a.x} ${a.y} L${a.x + a.w} ${a.y + a.h} ` +
+          `M${hd.l[0].toFixed(2)} ${hd.l[1].toFixed(2)} L${a.x + a.w} ${a.y + a.h} L${hd.r[0].toFixed(2)} ${hd.r[1].toFixed(2)}`);
+        path.setAttribute('stroke', a.color);
+      }
+      path.setAttribute('stroke-width', a.strokeW);
+      path.setAttribute('fill', 'none');
+      path.setAttribute('stroke-linecap', 'round');
+      path.setAttribute('stroke-linejoin', 'round');
+      svg.append(path);
+      n.append(svg);
     } else if (a.type === 'cover') {
       n = h('div', base);
       n.style.cssText = `left:${a.x * z}px;top:${a.y * z}px;width:${a.w * z}px;height:${a.h * z}px;background:${a.color}`;
@@ -1408,16 +1533,23 @@ function mountEditor() {
       svg.setAttribute('width', '100%'); svg.setAttribute('height', '100%');
       svg.setAttribute('viewBox', `0 0 ${Math.max(1, maxX - minX)} ${Math.max(1, maxY - minY)}`);
       svg.setAttribute('preserveAspectRatio', 'none');
-      const pl = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
-      pl.setAttribute('points', a.pts.map(p => (p[0] - minX) + ',' + (p[1] - minY)).join(' '));
-      pl.setAttribute('fill', 'none');
-      pl.setAttribute('stroke', a.color);
-      pl.setAttribute('stroke-width', a.strokeW);
-      pl.setAttribute('stroke-linecap', 'round');
-      pl.setAttribute('stroke-linejoin', 'round');
-      svg.append(pl);
+      for (const run of inkRuns(a)) {
+        const pl = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        pl.setAttribute('d', inkPathData(run.pts, minX, minY));
+        pl.setAttribute('fill', 'none');
+        pl.setAttribute('stroke', a.color);
+        pl.setAttribute('stroke-width', run.w);
+        pl.setAttribute('stroke-linecap', 'round');
+        pl.setAttribute('stroke-linejoin', 'round');
+        svg.append(pl);
+      }
       n.append(svg);
     }
+    /* An object is only grabbable with the Select tool. Otherwise a pen stroke
+       or a rubbing that happens to start on top of one would drag it instead of
+       drawing, which is exactly what it looked like it was doing. */
+    const grabbable = S.mode === 'select' || S.cropping === a.id || (S.mode === 'picture' && a.type === 'img');
+    if (!grabbable) n.style.pointerEvents = 'none';
     if (S.cropping !== a.id && !a.under) n.addEventListener('pointerdown', e => onAnnotDown(e, a, n));
     if (a.type === 'text') {
       n.addEventListener('dblclick', () => editText(a, n));
@@ -1436,9 +1568,44 @@ function mountEditor() {
     return { x: (e.clientX - r.left) / S.zoom, y: (e.clientY - r.top) / S.zoom };
   }
 
+  /* A rubber you cannot see is a rubber you cannot aim. The ring follows the
+     pointer at the size the rubbing will actually have — the only feedback
+     there is on a tablet, where there is no cursor at all. */
+  function rubberRing(layer) {
+    let ring = layer.querySelector('.rubring');
+    if (!ring) {
+      ring = h('div', { class: 'rubring' });
+      layer.append(ring);
+    }
+    return {
+      at(x, y) {
+        const d = S.rubberW * S.zoom;
+        ring.style.cssText = `width:${d}px;height:${d}px;left:${x * S.zoom}px;top:${y * S.zoom}px`;
+        ring.classList.add('on');
+      },
+      off() { ring.classList.remove('on'); }
+    };
+  }
+
   function bindLayer(layer, pg) {
+    /* while the rubber is the live tool, track the pointer even before it is
+       pressed, so a mouse user sees the size too */
+    layer.addEventListener('pointermove', e => {
+      if (S.mode !== 'rub') return;
+      if (e.buttons) return;                       // a stroke in progress draws its own
+      const q = ptFromEvent(e, layer);
+      rubberRing(layer).at(q.x, q.y);
+    });
+    layer.addEventListener('pointerleave', () => {
+      const ring = layer.querySelector('.rubring');
+      if (ring) ring.classList.remove('on');
+    });
     layer.addEventListener('pointerdown', e => {
       if (e.button !== 0) return;
+      if (e.pointerType === 'pen' && !S.penSeen) { S.penSeen = true; renderSidePanel(); }
+      /* Once a stylus has been used, a touch is a palm or a scroll — never a
+         line. Let the browser have it. */
+      if (isPalm(e) && S.mode !== 'select') return;
       if (e.target.closest('.an')) return;          // handled by the object
       const p = ptFromEvent(e, layer);
       if (S.mode === 'text') {
@@ -1455,35 +1622,80 @@ function mountEditor() {
         };
         // run after this gesture has fully settled, so nothing steals focus back
         window.addEventListener('pointerup', () => requestAnimationFrame(open), { once: true });
-      } else if (S.mode === 'hl' || S.mode === 'rect') {
+      } else if (S.mode === 'hl' || S.mode === 'rect' || S.mode === 'ellipse') {
         pushUndo();
         const a = {
           id: uid(), type: S.mode, page: pg.n, x: p.x, y: p.y, w: 1, h: S.mode === 'hl' ? S.fontSize * 1.1 : 1,
           color: S.mode === 'hl' ? (HL_PALETTE.includes(S.color) ? S.color : HL_PALETTE[0]) : S.color, strokeW: S.strokeW
         };
         S.annots.push(a);
+        let node = null;
         dragLoop(e, (dx, dy) => {
           a.w = Math.max(2, dx / S.zoom);
-          if (S.mode === 'rect') a.h = Math.max(2, dy / S.zoom);
-          else a.h = Math.max(S.fontSize * 0.9, dy / S.zoom || S.fontSize * 1.1);
-          repaint();
+          if (S.mode === 'hl') a.h = Math.max(S.fontSize * 0.9, dy / S.zoom || S.fontSize * 1.1);
+          else a.h = Math.max(2, dy / S.zoom);
+          node = swapNode(layer, a, node);
         }, () => { select(a.id); renderSidePanel(); });
+      } else if (S.mode === 'arrow') {
+        pushUndo();
+        // w/h are the vector from tail to tip, so either may be negative
+        const a = { id: uid(), type: 'arrow', page: pg.n, x: p.x, y: p.y, w: 1, h: 0, color: S.color, strokeW: S.strokeW };
+        S.annots.push(a);
+        let node = null;
+        dragLoop(e, (dx, dy) => {
+          a.w = dx / S.zoom; a.h = dy / S.zoom;
+          node = swapNode(layer, a, node);
+        }, () => {
+          if (Math.hypot(a.w, a.h) < 4) S.annots = S.annots.filter(x => x.id !== a.id);
+          else select(a.id);
+          repaint(); renderSidePanel();
+        });
+      } else if (S.mode === 'rub') {
+        pushUndo();
+        const stroke = { id: uid(), type: 'erase', page: pg.n, pts: [[p.x, p.y]], strokeW: S.rubberW };
+        const live = liveInk(layer, stroke, true);
+        const ring = rubberRing(layer);
+        ring.at(p.x, p.y);
+        captureGesture(layer, e, {
+          move: ev => {
+            let last = null;
+            for (const sample of allSamples(ev)) {
+              const q = ptFromEvent(sample, layer);
+              last = [clamp(q.x, 0, pg.w), clamp(q.y, 0, pg.h)];
+              stroke.pts.push(last);
+            }
+            if (last) ring.at(last[0], last[1]);
+            live.update();
+          },
+          end: async () => {
+            live.done();
+            ring.off();
+            const touched = await applyRubber(stroke);
+            if (!touched) S.undoStack.pop();          // nothing was under it
+            repaint(); renderSidePanel();
+          }
+        });
       } else if (S.mode === 'ink') {
         pushUndo();
-        const a = { id: uid(), type: 'ink', page: pg.n, pts: [[p.x, p.y]], color: S.color, strokeW: S.strokeW };
+        const a = { id: uid(), type: 'ink', page: pg.n, pts: [[p.x, p.y, penWidth(e, S.strokeW)]], color: S.color, strokeW: S.strokeW };
         S.annots.push(a);
-        const move = ev => {
-          const q = ptFromEvent(ev, layer);
-          a.pts.push([clamp(q.x, 0, pg.w), clamp(q.y, 0, pg.h)]);
-          repaint();
-        };
-        const up = () => {
-          window.removeEventListener('pointermove', move);
-          window.removeEventListener('pointerup', up);
-          if (a.pts.length < 3) { S.annots = S.annots.filter(x => x.id !== a.id); repaint(); }
-        };
-        window.addEventListener('pointermove', move);
-        window.addEventListener('pointerup', up);
+        /* Draw straight into one live path rather than rebuilding the layer on
+           every sample — on a tablet that rebuild is the whole lag. */
+        const live = liveInk(layer, a);
+        captureGesture(layer, e, {
+          move: ev => {
+            for (const sample of allSamples(ev)) {
+              const q = ptFromEvent(sample, layer);
+              a.pts.push([clamp(q.x, 0, pg.w), clamp(q.y, 0, pg.h), penWidth(sample, S.strokeW)]);
+            }
+            live.update();
+          },
+          end: () => {
+            live.done();
+            if (a.pts.length < 2) S.annots = S.annots.filter(x => x.id !== a.id);
+            repaint();
+          }
+        });
       } else if (S.mode === 'img' && S.pendingImage) {
         placePending(pg, p);
       } else if (S.mode === 'sign' && S.pendingSig) {
@@ -1508,19 +1720,63 @@ function mountEditor() {
 
   function dragLoop(e, onMove, onEnd) {
     const sx = e.clientX, sy = e.clientY;
+    const host = (e.currentTarget && e.currentTarget.setPointerCapture) ? e.currentTarget
+      : (e.target && e.target.setPointerCapture) ? e.target : null;
+    if (host) {
+      captureGesture(host, e, {
+        move: ev => { const last = allSamples(ev).pop(); onMove(last.clientX - sx, last.clientY - sy); },
+        end: () => { if (onEnd) onEnd(); }
+      });
+      return;
+    }
     const move = ev => onMove(ev.clientX - sx, ev.clientY - sy);
-    const up = () => {
+    const stop = () => {
       window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointerup', stop);
+      window.removeEventListener('pointercancel', stop);
       if (onEnd) onEnd();
     };
     window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+    window.addEventListener('pointerup', stop);
+    window.addEventListener('pointercancel', stop);
+  }
+
+  /* Replace one object's element in place. Re-creating a single node while
+     dragging costs nothing; rebuilding every object on the page does. */
+  function swapNode(layer, a, node) {
+    const fresh = annotEl(a);
+    if (node && node.parentNode === layer) layer.replaceChild(fresh, node);
+    else layer.append(fresh);
+    return fresh;
+  }
+
+  /* A single path element that grows as the stroke is drawn. */
+  function liveInk(layer, a, rubber) {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('class', 'liveink');
+    svg.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;overflow:visible;pointer-events:none;z-index:7';
+    svg.setAttribute('viewBox', `0 0 ${layer.clientWidth || 1} ${layer.clientHeight || 1}`);
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', rubber ? 'var(--mark)' : a.color);
+    path.setAttribute('stroke-opacity', rubber ? '0.35' : '1');
+    path.setAttribute('stroke-linecap', 'round');
+    path.setAttribute('stroke-linejoin', 'round');
+    svg.append(path);
+    layer.append(svg);
+    const z = S.zoom;
+    const update = () => {
+      path.setAttribute('d', a.pts.map((p, i) => (i ? 'L' : 'M') + (p[0] * z).toFixed(1) + ' ' + (p[1] * z).toFixed(1)).join(' '));
+      const last = a.pts[a.pts.length - 1];
+      path.setAttribute('stroke-width', ((rubber ? a.strokeW : (last[2] || a.strokeW)) * z).toFixed(2));
+    };
+    update();
+    return { update, done: () => svg.remove() };
   }
 
   function onAnnotDown(e, a, node) {
     e.stopPropagation();
-    if (S.mode === 'erase') { pushUndo(); S.annots = S.annots.filter(x => x.id !== a.id); select(null); repaint(); return; }
     if (node.getAttribute('contenteditable') === 'true') return;
     select(a.id);
     renderSidePanel();
@@ -1541,6 +1797,10 @@ function mountEditor() {
     const ow = a.w, oh = a.h, os = a.size;
     pushUndo();
     dragLoop(e, (dx, dy) => {
+      if (a.type === 'arrow') {            // the handle is the tip: any direction
+        a.w = ow + dx / S.zoom; a.h = oh + dy / S.zoom;
+        repaint(); return;
+      }
       a.w = Math.max(8, ow + dx / S.zoom);
       if (a.type === 'text') a.size = Math.max(6, Math.round(os * (a.w / Math.max(1, ow))));
       else a.h = Math.max(4, oh + dy / S.zoom);
@@ -1578,6 +1838,39 @@ function mountEditor() {
         ev.preventDefault(); node.blur();
       }
     });
+  }
+
+  /* Rub out what the stroke passed over. Pen strokes are cut exactly; anything
+     else is re-drawn once as a picture with those pixels knocked out. */
+  async function applyRubber(stroke) {
+    const r = stroke.strokeW / 2;
+    const next = [];
+    let touched = false;
+    const redraw = [];
+    for (const a of S.annots) {
+      if (a.page !== stroke.page || a.type === 'erase') { next.push(a); continue; }
+      if (a.type === 'ink') {
+        const runs = splitInk(a, stroke, r);
+        if (runs === null) { next.push(a); continue; }
+        touched = true;
+        for (const run of runs) next.push(Object.assign({}, a, { id: uid(), pts: run }));
+        continue;
+      }
+      if (rubberHitsBox(shapeBox(a), stroke, r)) { touched = true; redraw.push(a); next.push(a); continue; }
+      next.push(a);
+    }
+    S.annots = next;
+    for (const a of redraw) {
+      try {
+        const flat = await rubberise(a, [stroke]);
+        if (flat) {
+          const i = S.annots.findIndex(x => x.id === a.id);
+          if (i >= 0) S.annots[i] = flat;
+        }
+      } catch (err) { console.error(err); toast('That object could not be rubbed out.', true); }
+    }
+    if (touched) select(null);
+    return touched;
   }
 
   function select(id) {
@@ -1726,6 +2019,25 @@ function mountEditor() {
             x: p.x, y: p.y, width: a.w, height: a.h, rotate: degrees(R),
             borderColor: hex2rgb(a.color), borderWidth: a.strokeW
           });
+        } else if (a.type === 'ellipse') {
+          const c = map(a.x + a.w / 2, a.y + a.h / 2);
+          const swap = R === 90 || R === 270;
+          page.drawEllipse({
+            x: c.x, y: c.y,
+            xScale: Math.abs((swap ? a.h : a.w) / 2), yScale: Math.abs((swap ? a.w : a.h) / 2),
+            borderColor: hex2rgb(a.color), borderWidth: a.strokeW, opacity: 0
+          });
+        } else if (a.type === 'arrow') {
+          const hd = arrowHead(a);
+          const line = (ax, ay, bx, by) => page.drawLine({
+            start: map(ax, ay), end: map(bx, by),
+            thickness: a.strokeW, color: hex2rgb(a.color), lineCap: 1
+          });
+          line(a.x, a.y, a.x + a.w, a.y + a.h);
+          line(hd.l[0], hd.l[1], a.x + a.w, a.y + a.h);
+          line(hd.r[0], hd.r[1], a.x + a.w, a.y + a.h);
+        } else if (a.type === 'erase') {
+          continue;                     // a rubbing is not something to draw
         } else if (a.type === 'cover') {
           const p = map(a.x, a.y, a.w, a.h);
           page.drawRectangle({
@@ -1735,7 +2047,9 @@ function mountEditor() {
           for (let i = 1; i < a.pts.length; i++) {
             const s = map(a.pts[i - 1][0], a.pts[i - 1][1]);
             const e = map(a.pts[i][0], a.pts[i][1]);
-            page.drawLine({ start: s, end: e, thickness: a.strokeW, color: hex2rgb(a.color), lineCap: 1 });
+            // the pencil's pressure, segment by segment
+            const t = ((a.pts[i][2] || a.strokeW) + (a.pts[i - 1][2] || a.strokeW)) / 2;
+            page.drawLine({ start: s, end: e, thickness: t, color: hex2rgb(a.color), lineCap: 1 });
           }
         } else if (a.type === 'img') {
           const baked = await bakeImage(a);
@@ -3219,6 +3533,262 @@ function mountToWord() {
 
   panel();
   run();
+}
+
+/* ============================================== pointer input and ink shape
+
+   A stylus is not a mouse. On a tablet the browser's first instinct when a
+   pointer moves across a scrollable page is to pan it, which cancels the
+   gesture mid-stroke; it delivers one move per frame while a pencil samples at
+   several hundred hertz; and it reports a palm resting on the glass as an
+   ordinary touch. These helpers deal with all three, and carry the pressure the
+   pencil reports through to the width of the line. */
+
+/* Every sample the browser buffered since the last frame, not just the latest —
+   this is the difference between a smooth curve and a row of chords. */
+function allSamples(ev) {
+  if (typeof ev.getCoalescedEvents === 'function') {
+    try {
+      const list = ev.getCoalescedEvents();
+      if (list && list.length) return list;
+    } catch (e) { /* older engines throw instead of returning nothing */ }
+  }
+  return [ev];
+}
+
+/* A pencil reports 0..1; a mouse reports 0.5 while a button is down and a
+   finger often reports 0, so only a real stylus is allowed to vary the line. */
+function penWidth(ev, base) {
+  if (ev.pointerType !== 'pen') return base;
+  const p = typeof ev.pressure === 'number' && ev.pressure > 0 ? ev.pressure : 0.5;
+  return +(base * (0.45 + 1.15 * p)).toFixed(3);
+}
+
+/* Ignore the heel of a hand once a stylus has been seen on this document. It
+   switches itself on the first time a pen touches the glass, and the panel lets
+   you switch it off again for a session of finger drawing. */
+function isPalm(ev) {
+  return ev.pointerType === 'touch' && S.penSeen && S.penOnly;
+}
+
+/* Hold the gesture on one element so a stroke that wanders off the page, over
+   the panel or past the window edge still arrives in one piece. */
+function captureGesture(el, ev, { move, end, cancel }) {
+  const id = ev.pointerId;
+  try { el.setPointerCapture(id); } catch (e) { /* capture is best-effort */ }
+  const onMove = e => { if (e.pointerId === id) move(e); };
+  const finish = kind => e => {
+    if (e && e.pointerId !== id) return;
+    el.removeEventListener('pointermove', onMove);
+    el.removeEventListener('pointerup', up);
+    el.removeEventListener('pointercancel', cancelled);
+    el.removeEventListener('lostpointercapture', cancelled);
+    try { el.releasePointerCapture(id); } catch (e2) {}
+    if (kind === 'up') end && end(e);
+    else (cancel || end) && (cancel || end)(e);
+  };
+  const up = finish('up');
+  const cancelled = finish('cancel');
+  el.addEventListener('pointermove', onMove);
+  el.addEventListener('pointerup', up);
+  el.addEventListener('pointercancel', cancelled);
+  el.addEventListener('lostpointercapture', cancelled);
+}
+
+/* A stroke is stored as [x, y, width]. Consecutive segments of a similar width
+   are drawn as one path, so a pressure-varying line is a handful of elements
+   rather than one per sample. */
+function inkRuns(a) {
+  const base = a.strokeW || 2;
+  const q = w => Math.max(0.2, Math.round((w || base) * 4) / 4);     // 0.25pt steps
+  const runs = [];
+  for (let i = 1; i < a.pts.length; i++) {
+    const w = q(((a.pts[i][2] || base) + (a.pts[i - 1][2] || base)) / 2);
+    const last = runs[runs.length - 1];
+    if (last && last.w === w) last.pts.push(a.pts[i]);
+    else runs.push({ w, pts: [a.pts[i - 1], a.pts[i]] });
+  }
+  if (!runs.length && a.pts.length === 1) runs.push({ w: q(a.pts[0][2]), pts: [a.pts[0], a.pts[0]] });
+  return runs;
+}
+
+function inkPathData(pts, ox, oy) {
+  return pts.map((p, i) => (i ? 'L' : 'M') + (p[0] - ox).toFixed(2) + ' ' + (p[1] - oy).toFixed(2)).join(' ');
+}
+
+/* ==================================================== shapes and the eraser
+
+   Circle and arrow are ordinary vector objects: they draw as SVG on screen and
+   as real PDF geometry on save. The eraser is the interesting one. Rubbing out
+   part of a pen stroke is exact — the points under the rubber are dropped and
+   the stroke splits into the pieces that survive, so it stays vector and the
+   page underneath is never touched. Nothing else can be cut that way, so a
+   shape, a text box or a picture that is partly rubbed out is re-drawn once as
+   a bitmap with the rubbed-out pixels knocked out of it. Either way the eraser
+   only ever takes away things you added; the document's own ink is not its
+   business — that is what a white Box is for. */
+
+function shapeBox(a) {
+  if (a.type === 'arrow') {
+    return { x: Math.min(a.x, a.x + a.w), y: Math.min(a.y, a.y + a.h), w: Math.abs(a.w), h: Math.abs(a.h) };
+  }
+  if (a.pts && a.pts.length) {
+    const xs = a.pts.map(p => p[0]), ys = a.pts.map(p => p[1]);
+    return { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) };
+  }
+  return { x: a.x, y: a.y, w: a.w || 0, h: a.h || 0 };
+}
+
+/* distance from a point to a line segment */
+function segDist(px, py, x1, y1, x2, y2) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const len = dx * dx + dy * dy;
+  let t = len ? ((px - x1) * dx + (py - y1) * dy) / len : 0;
+  t = clamp(t, 0, 1);
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
+function underRubber(x, y, stroke, r) {
+  const p = stroke.pts;
+  if (p.length === 1) return Math.hypot(x - p[0][0], y - p[0][1]) <= r;
+  for (let i = 1; i < p.length; i++) {
+    if (segDist(x, y, p[i - 1][0], p[i - 1][1], p[i][0], p[i][1]) <= r) return true;
+  }
+  return false;
+}
+
+function rubberHitsBox(box, stroke, r) {
+  for (const [x, y] of stroke.pts) {
+    if (x >= box.x - r && x <= box.x + box.w + r && y >= box.y - r && y <= box.y + box.h + r) return true;
+  }
+  return false;
+}
+
+/* Drop the points that fall under the rubber; what is left becomes one stroke
+   per surviving run. Returns null when the stroke was not touched at all. */
+function splitInk(a, stroke, r) {
+  const keep = a.pts.map(p => !underRubber(p[0], p[1], stroke, r));
+  if (keep.every(Boolean)) return null;
+  const runs = [];
+  let cur = [];
+  a.pts.forEach((p, i) => {
+    if (keep[i]) cur.push(p.slice());
+    else if (cur.length) { runs.push(cur); cur = []; }
+  });
+  if (cur.length) runs.push(cur);
+  return runs.filter(run => run.length > 1);
+}
+
+/* ---- drawing an object onto a 2D context, for the rubbed-out case ---- */
+function paintAnnot(ctx, a, k, ox, oy) {
+  ctx.save();
+  ctx.translate(-ox * k, -oy * k);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.strokeStyle = a.color || '#000';
+  ctx.fillStyle = a.color || '#000';
+  ctx.lineWidth = Math.max(0.5, (a.strokeW || 1) * k);
+  if (a.type === 'rect') {
+    ctx.strokeRect(a.x * k, a.y * k, a.w * k, a.h * k);
+  } else if (a.type === 'ellipse') {
+    ctx.beginPath();
+    ctx.ellipse((a.x + a.w / 2) * k, (a.y + a.h / 2) * k, Math.abs(a.w / 2) * k, Math.abs(a.h / 2) * k, 0, 0, Math.PI * 2);
+    ctx.stroke();
+  } else if (a.type === 'arrow') {
+    const x1 = a.x * k, y1 = a.y * k, x2 = (a.x + a.w) * k, y2 = (a.y + a.h) * k;
+    const head = arrowHead(a);
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(head.l[0] * k, head.l[1] * k); ctx.lineTo(x2, y2); ctx.lineTo(head.r[0] * k, head.r[1] * k);
+    ctx.stroke();
+  } else if (a.type === 'hl') {
+    ctx.globalAlpha = 0.55;
+    ctx.fillRect(a.x * k, a.y * k, a.w * k, a.h * k);
+    ctx.globalAlpha = 1;
+  } else if (a.type === 'cover') {
+    ctx.fillRect(a.x * k, a.y * k, a.w * k, a.h * k);
+  } else if (a.type === 'ink') {
+    for (const run of inkRuns(a)) {
+      ctx.lineWidth = Math.max(0.5, run.w * k);
+      ctx.beginPath();
+      run.pts.forEach((p, i) => i ? ctx.lineTo(p[0] * k, p[1] * k) : ctx.moveTo(p[0] * k, p[1] * k));
+      ctx.stroke();
+    }
+  } else if (a.type === 'text') {
+    const fam = fontCss(a.font);
+    const wt = /Bold/.test(a.font) ? 700 : 400;
+    const st = /Italic|Oblique/.test(a.font) ? 'italic' : 'normal';
+    ctx.font = `${st} ${wt} ${a.size * k}px ${fam}`;
+    ctx.textBaseline = 'alphabetic';
+    const lh = (a.lh || a.size * 1.22) * k;
+    String(a.text || '').split('\n').forEach((line, i) => {
+      ctx.fillText(line, a.x * k, (a.y + a.size * 0.82) * k + i * lh);
+    });
+  }
+  ctx.restore();
+}
+
+/* the two barbs of an arrow head, in page points */
+function arrowHead(a) {
+  const ang = Math.atan2(a.h, a.w);
+  const len = Math.max(6, Math.min(16, Math.hypot(a.w, a.h) * 0.22, (a.strokeW || 2) * 5));
+  const spread = 0.42;
+  const tipX = a.x + a.w, tipY = a.y + a.h;
+  return {
+    l: [tipX - len * Math.cos(ang - spread), tipY - len * Math.sin(ang - spread)],
+    r: [tipX - len * Math.cos(ang + spread), tipY - len * Math.sin(ang + spread)]
+  };
+}
+
+/* Re-draw one object with the rubbed-out pixels knocked out, and hand back a
+   picture to put in its place. */
+async function rubberise(a, strokes) {
+  const box = shapeBox(a);
+  const pad = Math.max(4, (a.strokeW || 2) * 2, a.type === 'text' ? a.size * 0.5 : 0);
+  const x = box.x - pad, y = box.y - pad, w = box.w + pad * 2, h = box.h + pad * 2;
+  if (w < 1 || h < 1) return null;
+  const k = clamp(Math.sqrt(2.2e6 / Math.max(1, w * h)), 1.5, 4);     // ~4x, capped by area
+  const cv = document.createElement('canvas');
+  cv.width = Math.max(1, Math.round(w * k));
+  cv.height = Math.max(1, Math.round(h * k));
+  const ctx = cv.getContext('2d');
+
+  if (a.type === 'img') {
+    const img = await new Promise((res, rej) => {
+      const im = new Image();
+      im.onload = () => res(im); im.onerror = rej;
+      im.src = a.url;
+    });
+    ctx.save();
+    if (a.filter) ctx.filter = cssFilter(a.filter);
+    if (a.opacity != null) ctx.globalAlpha = a.opacity;
+    ctx.drawImage(img, (a.x - x) * k, (a.y - y) * k, a.w * k, a.h * k);
+    ctx.restore();
+  } else {
+    paintAnnot(ctx, a, k, x, y);
+  }
+
+  ctx.globalCompositeOperation = 'destination-out';
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = '#000';
+  for (const s of strokes) {
+    ctx.lineWidth = Math.max(1, s.strokeW * k);
+    ctx.beginPath();
+    s.pts.forEach((p, i) => {
+      const px = (p[0] - x) * k, py = (p[1] - y) * k;
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    if (s.pts.length === 1) { ctx.lineTo((s.pts[0][0] - x) * k + 0.01, (s.pts[0][1] - y) * k); }
+    ctx.stroke();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+
+  /* The export path embeds bytes, not a data URL, so hand back both. */
+  const blob = await new Promise(res => cv.toBlob(res, 'image/png'));
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  return {
+    id: uid(), type: 'img', page: a.page, x, y, w, h,
+    url: cv.toDataURL('image/png'), bytes, fmt: 'png',
+    rubbed: true, nat: { w: cv.width, h: cv.height }
+  };
 }
 
 /* ================================================================= OCR

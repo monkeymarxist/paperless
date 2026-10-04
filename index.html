@@ -182,13 +182,59 @@ footer .dot{color:var(--line-2)}
 .trb svg{width:19px;height:19px}
 .trb:hover{background:var(--sunk)}
 .trb[aria-pressed="true"]{background:var(--accent);color:var(--on-accent)}
+/* Draw is a group: the drawer slides open on a grid-rows transition, which
+   animates from nothing to the content's own height without hardcoding it.
+   On the narrow layout the rail runs across, so the drawer opens sideways. */
+.trb-group{position:relative}
+.trb-group .chev{position:absolute;right:4px;top:8px;transition:transform .2s;opacity:.7}
+.trb-group .chev svg{width:12px;height:12px}
+.trb-group[aria-expanded="true"] .chev{transform:rotate(90deg)}
+.subrail{display:grid;grid-template-rows:0fr;transition:grid-template-rows .22s ease}
+.subrail.open{grid-template-rows:1fr}
+.subrail-in{overflow:hidden;display:grid;gap:2px}
+.trb-sub{font-size:10px;padding:7px 2px;border-radius:7px;margin-left:8px;
+  border-left:2px solid var(--line);background:var(--sunk)}
+.trb-sub svg{width:16px;height:16px}
+.trb-sub[aria-pressed="true"]{background:var(--accent);color:var(--on-accent);border-left-color:var(--accent)}
+@media(max-width:860px){
+  /* The rail runs across here, so the drawer opens sideways. A row of flex
+     items has no definite width for a 1fr track to resolve against, so this one
+     animates max-width instead and lets the content decide the rest. */
+  .subrail{display:flex;flex:none;grid-template-rows:none;max-width:0;overflow:hidden;
+    transition:max-width .25s ease}
+  .subrail.open{max-width:340px}
+  .subrail-in{display:flex;gap:2px;overflow:visible}
+  .trb-sub{min-width:54px;margin-left:0;border-left:0;border-top:2px solid var(--line)}
+  .trb-sub[aria-pressed="true"]{border-top-color:var(--accent)}
+  .trb-group .chev{right:2px;top:auto;bottom:2px}
+  .trb-group[aria-expanded="true"] .chev{transform:rotate(90deg)}
+}
 .wb-stage{flex:1;min-width:0;overflow:auto;background:var(--sunk);position:relative}
 .wb-side{flex:none;width:258px;border-left:1px solid var(--line);background:var(--paper);overflow-y:auto;padding:14px}
 @media(max-width:860px){
   .wb-body{flex-direction:column}
   .wb-rail{width:auto;flex-direction:row;border-right:0;border-bottom:1px solid var(--line);overflow-x:auto;padding:6px}
   .trb{flex:none;min-width:58px}
-  .wb-side{width:auto;border-left:0;border-top:1px solid var(--line);max-height:38vh}
+  /* On a tablet the panel sits along the bottom edge, where every pixel is one
+     the document does not get. Keep the controls, drop the prose. */
+  .wb-side{width:auto;border-left:0;border-top:1px solid var(--line);
+    max-height:96px;padding:8px 10px;display:flex;flex-wrap:wrap;align-items:center;
+    gap:6px 14px;overflow:auto;overscroll-behavior:contain}
+  .wb-side .pane-h,.wb-side>p,.wb-side .hint,.wb-side details{display:none}
+  .wb-side .field{display:flex;align-items:center;gap:8px;margin:0;flex:none}
+  .wb-side .field label{font-size:11.5px;white-space:nowrap;color:var(--ink-3)}
+  .wb-side .field label[for]{color:var(--ink-2)}
+  /* the slider gets a fixed width; letting it flex made it overflow its own
+     field and paint over the next one */
+  .wb-side .rangerow{width:auto;gap:6px;flex:none}
+  .wb-side .rangerow input[type=range]{width:104px;flex:none}
+  .wb-side .rangerow .val{min-width:42px;font-size:11px;white-space:nowrap;text-align:left}
+  .wb-side .swatches{flex-wrap:nowrap}
+  .wb-side .sw{width:20px;height:20px}
+  .wb-side .seg,.wb-side .btn,.wb-side .grid2{flex:none;width:auto}
+  .wb-side .grid2{display:flex;gap:6px}
+  .wb-side .btn{padding:6px 10px;font-size:12.5px}
+  .wb-side select,.wb-side input[type=text]{width:auto;min-width:110px;padding:5px 7px;font-size:12.5px}
   .compact .sliders{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}
   .compact .grid2{gap:6px 10px}
 }
@@ -225,6 +271,17 @@ footer .dot{color:var(--line-2)}
 .page{position:relative;background:#fff;box-shadow:var(--shadow-lg);flex:none}
 .page canvas{display:block;width:100%;height:100%}
 .layer{position:absolute;inset:0;overflow:hidden}
+/* With a drawing tool up, a pointer dragged across the page must draw rather
+   than pan the view — otherwise the browser takes the gesture and cancels the
+   stroke halfway. Pinch still zooms, and the grey around the page still scrolls. */
+.wb-stage.drawing .layer{touch-action:pinch-zoom;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+.wb-stage.drawing .page{touch-action:pinch-zoom}
+.wb-stage .layer{-webkit-tap-highlight-color:transparent}
+.wb-stage.drawing .layer{cursor:crosshair}
+.rubring{position:absolute;border:1.5px solid var(--mark);border-radius:50%;transform:translate(-50%,-50%);
+  background:color-mix(in srgb,var(--mark) 12%,transparent);pointer-events:none;z-index:8;
+  opacity:0;transition:opacity .12s}
+.rubring.on{opacity:.9}
 .pgnum{position:absolute;left:50%;transform:translateX(-50%);bottom:-17px;font-family:var(--mono);font-size:11px;color:var(--ink-3)}
 
 /* text layer: clickable boxes over the document's own text runs */
@@ -372,7 +429,7 @@ footer .dot{color:var(--line-2)}
       <a href="https://x.com/monkeymarxist" target="_blank" rel="noopener noreferrer">@monkeymarxist</a>
       <span class="dot">·</span>
       <a href="https://monkeymarxist.github.io/p2pchat/LICENSE.txt" target="_blank" rel="noopener noreferrer">AGPL-3.0</a>
-      <span class="mono" style="margin-left:auto;font-size:12px">Build 22</span>
+      <span class="mono" style="margin-left:auto;font-size:12px">Build 25</span>
     </footer>
   </div>
 </section>

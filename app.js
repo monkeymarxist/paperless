@@ -152,13 +152,18 @@ const S = {
   annots: [], undoStack: [], redoStack: [],
   mode: 'select', sizeMode: 'match', ratioGroups: new Map(), cropping: null, sideClosed: false, overflow: 'shrink',
   fmt: { weight: null, italic: null, color: null, scale: 1 }, lastRun: null,
-  color: '#000000', fontSize: 16, fontName: 'Helvetica', strokeW: 2.5, rubberW: 14, penSeen: false, penOnly: true,
+  color: '#000000', fontSize: 16, fontName: 'Helvetica', strokeW: 2.5, rubberW: 14, penSeen: false, penOnly: true, cancelStroke: null, touches: 0,
   zoom: 1, sel: null,
   pageEls: []
 };
 
 const PALETTE = ['#000000', '#6b615d', '#8a0f14', '#0a74b8', '#1a7f4f', '#d08700', '#ffffff'];
 const HL_PALETTE = ['#ffe44d', '#9cf27f', '#8fd4ff', '#ffb0d6', '#ffbb7a'];
+
+/* A finger is not a mouse: coarse pointers get bigger targets and fewer steps. */
+function coarsePointer() {
+  try { return window.matchMedia('(pointer: coarse)').matches; } catch (e) { return false; }
+}
 
 function hex2rgb(x) {
   const m = x.replace('#', '');
@@ -433,6 +438,7 @@ function mountEditor() {
   );
 
   drawSheet();
+  bindStageGestures();
   renderSidePanel();
   fitZoom();
 
@@ -1222,7 +1228,7 @@ function mountEditor() {
     if (S.mode === 'edittext') {
       const edits = S.annots.filter(a => a.type === 'cover').length;
       side.append(h('p', { class: 'mono', style: 'font-size:12px;color:var(--ink-2);margin-bottom:14px' },
-        `${edits} block${edits === 1 ? '' : 's'} replaced \u00b7 build 25`));
+        `${edits} block${edits === 1 ? '' : 's'} replaced \u00b7 build 26`));
       side.append(h('div', { class: 'field' },
         h('label', null, 'Replacement size'),
         h('div', { class: 'seg' },
@@ -1387,6 +1393,78 @@ function mountEditor() {
       if (S.mode !== 'select') return;
       if (!e.target.closest('.an') && !e.target.closest('.handle')) select(null);
     });
+  }
+
+  /* On a tablet the page still has to be navigable while a pen tool is live, so
+     the stage takes the gestures the browser can no longer handle for us: two
+     fingers pan and pinch, and — when the pencil owns the drawing — one finger
+     pans too. A second finger landing mid-stroke means the stroke was never
+     meant to be one, so it is rolled back. */
+  function bindStageGestures() {
+    const stage = $('#wb-stage');
+    const live = new Map();
+    let gesture = null, frame = null;
+
+    const apply = () => {
+      frame = null;
+      if (!gesture) return;
+      const ps = [...live.values()];
+      if (!ps.length) return;
+      if (gesture.single) {
+        stage.scrollLeft = gesture.sl - (ps[0].x - gesture.x0);
+        stage.scrollTop = gesture.st - (ps[0].y - gesture.y0);
+        return;
+      }
+      if (ps.length < 2) return;
+      const mx = (ps[0].x + ps[1].x) / 2, my = (ps[0].y + ps[1].y) / 2;
+      const d = Math.hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y);
+      if (gesture.d0 > 24) {
+        const want = clamp(gesture.z0 * (d / gesture.d0), 0.25, 4);
+        if (Math.abs(want - S.zoom) > 0.01) setZoom(want);
+      }
+      stage.scrollLeft = gesture.sl - (mx - gesture.mx0);
+      stage.scrollTop = gesture.st - (my - gesture.my0);
+    };
+    const schedule = () => { if (!frame) frame = requestAnimationFrame(apply); };
+
+    stage.addEventListener('pointerdown', e => {
+      if (e.pointerType !== 'touch') return;
+      live.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      S.touches = live.size;
+      if (live.size === 2) {
+        if (S.cancelStroke) S.cancelStroke();        // that first finger was not a stroke
+        const ps = [...live.values()];
+        gesture = {
+          mx0: (ps[0].x + ps[1].x) / 2, my0: (ps[0].y + ps[1].y) / 2,
+          d0: Math.hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y),
+          sl: stage.scrollLeft, st: stage.scrollTop, z0: S.zoom
+        };
+      } else if (live.size === 1 && DRAW_MODES.includes(S.mode) && S.penSeen && S.penOnly) {
+        // the pencil draws, so a finger is for getting around
+        gesture = { single: true, x0: e.clientX, y0: e.clientY, sl: stage.scrollLeft, st: stage.scrollTop };
+      }
+    }, true);
+
+    stage.addEventListener('pointermove', e => {
+      if (e.pointerType !== 'touch') return;
+      const p = live.get(e.pointerId);
+      if (!p) return;
+      p.x = e.clientX; p.y = e.clientY;
+      if (gesture) { if (e.cancelable) e.preventDefault(); schedule(); }
+    }, true);
+
+    const drop = e => {
+      if (e.pointerType !== 'touch') return;
+      live.delete(e.pointerId);
+      S.touches = live.size;
+      if (live.size === 0) gesture = null;
+      else if (gesture && !gesture.single && live.size === 1) {
+        const ps = [...live.values()];
+        gesture = { single: true, x0: ps[0].x, y0: ps[0].y, sl: stage.scrollLeft, st: stage.scrollTop };
+      }
+    };
+    stage.addEventListener('pointerup', drop, true);
+    stage.addEventListener('pointercancel', drop, true);
   }
 
   function observeRender() {
@@ -1603,6 +1681,9 @@ function mountEditor() {
     layer.addEventListener('pointerdown', e => {
       if (e.button !== 0) return;
       if (e.pointerType === 'pen' && !S.penSeen) { S.penSeen = true; renderSidePanel(); }
+      /* The stage counts fingers before this runs. A second one means the
+         gesture is a pan or a pinch, not a line. */
+      if (e.pointerType === 'touch' && S.touches > 1) return;
       /* Once a stylus has been used, a touch is a palm or a scroll — never a
          line. Let the browser have it. */
       if (isPalm(e) && S.mode !== 'select') return;
@@ -1656,6 +1737,7 @@ function mountEditor() {
         const live = liveInk(layer, stroke, true);
         const ring = rubberRing(layer);
         ring.at(p.x, p.y);
+        S.cancelStroke = () => { live.done(); ring.off(); S.undoStack.pop(); S.cancelStroke = null; };
         captureGesture(layer, e, {
           move: ev => {
             let last = null;
@@ -1668,6 +1750,8 @@ function mountEditor() {
             live.update();
           },
           end: async () => {
+            if (!S.cancelStroke) return;
+            S.cancelStroke = null;
             live.done();
             ring.off();
             const touched = await applyRubber(stroke);
@@ -1682,6 +1766,13 @@ function mountEditor() {
         /* Draw straight into one live path rather than rebuilding the layer on
            every sample — on a tablet that rebuild is the whole lag. */
         const live = liveInk(layer, a);
+        S.cancelStroke = () => {
+          live.done();
+          S.annots = S.annots.filter(x => x.id !== a.id);
+          S.undoStack.pop();
+          S.cancelStroke = null;
+          repaint();
+        };
         captureGesture(layer, e, {
           move: ev => {
             for (const sample of allSamples(ev)) {
@@ -1691,6 +1782,8 @@ function mountEditor() {
             live.update();
           },
           end: () => {
+            if (!S.cancelStroke) return;            // two fingers already undid it
+            S.cancelStroke = null;
             live.done();
             if (a.pts.length < 2) S.annots = S.annots.filter(x => x.id !== a.id);
             repaint();
@@ -1900,15 +1993,44 @@ function mountEditor() {
   async function insertImage() {
     const f = await pickFile('image/png,image/jpeg,image/webp');
     S.mode = 'select';
-    if (!f) { renderSidePanel(); return; }
+    if (!f) { syncRail(); renderSidePanel(); return; }
     try {
       const img = await loadImageFile(f);
       S.pendingImage = img;
+      /* With a finger, asking for a second tap to place it is a step people
+         lose the picture on. Drop it on the page they are looking at instead;
+         it arrives selected and can be dragged anywhere. */
+      if (coarsePointer()) {
+        const rec = visiblePage();
+        if (rec) {
+          placePending(rec.pg, { x: Math.max(12, rec.pg.w / 2 - 60), y: Math.max(12, visibleTop(rec) + 40) });
+          toast('Image placed — drag it where you want it');
+          return;
+        }
+      }
       S.mode = 'img';
-      $('#wb-rail').querySelectorAll('.trb').forEach(b => b.setAttribute('aria-pressed', b.dataset.mode === 'img'));
-      toast('Click on a page to place the image');
+      syncRail();
+      toast('Click a page to place the image');
     } catch (e) { toast('That image could not be read.', true); }
     renderSidePanel();
+  }
+
+  /* the page the reader is actually looking at */
+  function visiblePage() {
+    const stage = $('#wb-stage');
+    const mid = stage.scrollTop + stage.clientHeight / 2;
+    let best = null, bestD = Infinity;
+    for (const r of S.pageEls) {
+      const top = r.box.offsetTop, bottom = top + r.box.offsetHeight;
+      const d = (mid < top) ? top - mid : (mid > bottom ? mid - bottom : 0);
+      if (d < bestD) { bestD = d; best = r; }
+    }
+    return best;
+  }
+  /* how far down that page the viewport starts, in page points */
+  function visibleTop(rec) {
+    const stage = $('#wb-stage');
+    return clamp((stage.scrollTop - rec.box.offsetTop) / S.zoom, 0, Math.max(0, rec.pg.h - 80));
   }
 
   function signatureDialog() {

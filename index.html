@@ -274,8 +274,13 @@ footer .dot{color:var(--line-2)}
 /* With a drawing tool up, a pointer dragged across the page must draw rather
    than pan the view — otherwise the browser takes the gesture and cancels the
    stroke halfway. Pinch still zooms, and the grey around the page still scrolls. */
-.wb-stage.drawing .layer{touch-action:pinch-zoom;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
-.wb-stage.drawing .page{touch-action:pinch-zoom}
+.wb-stage.drawing{touch-action:none}
+.wb-stage.drawing .layer,.wb-stage.drawing .page{touch-action:none;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+/* Anything you drag has to own its gesture, or the tablet scrolls the page
+   instead of moving the thing under your finger. */
+.an,.handle,.movebar,.wrapgrip,.cropsel,.iroi,.trun{touch-action:none}
+.thumb,.frow .mv button{touch-action:manipulation}
 .wb-stage .layer{-webkit-tap-highlight-color:transparent}
 .wb-stage.drawing .layer{cursor:crosshair}
 .rubring{position:absolute;border:1.5px solid var(--mark);border-radius:50%;transform:translate(-50%,-50%);
@@ -387,6 +392,33 @@ footer .dot{color:var(--line-2)}
 .sheetbox p{font-size:13.5px;color:var(--ink-2)}
 .sheetbox .row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
 #sigpad{width:100%;height:160px;border:1px dashed var(--line-2);border-radius:9px;background:var(--bg);touch-action:none;cursor:crosshair}
+/* ---------- touch ---------- */
+@media (pointer: coarse){
+  /* 13px corner handles cannot be hit with a finger */
+  .handle{width:26px;height:26px;right:-9px;bottom:-9px;border-radius:50%;border-width:3px}
+  .movebar{height:16px;top:-19px;border-radius:8px}
+  .wrapgrip{width:14px;right:-14px;border-radius:7px}
+  .btn{min-height:40px}
+  .btn.sm{min-height:34px}
+  .trb{min-height:56px;padding:9px 2px}
+  .trb-sub{min-height:52px}
+  .thumb .ops button{width:38px;height:36px}
+  .thumb .ops button svg{width:16px;height:16px}
+  .frow .mv button{width:36px;height:36px}
+  .frow .mv svg{width:16px;height:16px}
+  .sw{width:30px;height:30px}
+  input[type=range]{height:30px}
+  .seg button{min-height:40px}
+  details.faq summary{padding:14px 0}
+  .tool{padding:16px 10px 16px 12px}
+}
+/* Without a mouse there is no hover, so anything revealed by hovering has to
+   be there all the time. */
+@media (hover: none){
+  .thumb .ops,.iroi .tag{opacity:1}
+  .rubring{opacity:0}
+  .rubring.on{opacity:.9}
+}
 @media(prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 </style>
 </head>
@@ -429,7 +461,7 @@ footer .dot{color:var(--line-2)}
       <a href="https://x.com/monkeymarxist" target="_blank" rel="noopener noreferrer">@monkeymarxist</a>
       <span class="dot">·</span>
       <a href="https://monkeymarxist.github.io/p2pchat/LICENSE.txt" target="_blank" rel="noopener noreferrer">AGPL-3.0</a>
-      <span class="mono" style="margin-left:auto;font-size:12px">Build 25</span>
+      <span class="mono" style="margin-left:auto;font-size:12px">Build 26</span>
     </footer>
   </div>
 </section>

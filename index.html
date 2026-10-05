@@ -290,7 +290,10 @@ footer .dot{color:var(--line-2)}
 .pgnum{position:absolute;left:50%;transform:translateX(-50%);bottom:-17px;font-family:var(--mono);font-size:11px;color:var(--ink-3)}
 
 /* text layer: clickable boxes over the document's own text runs */
-.tlayer{position:absolute;inset:0;overflow:hidden}
+/* The text and picture layers cover the whole page, so they must let clicks
+   through to the objects underneath; only their own boxes are interactive. */
+.tlayer{position:absolute;inset:0;overflow:hidden;pointer-events:none}
+.tlayer>*{pointer-events:auto}
 .trun{position:absolute;border-radius:2px;cursor:text;transition:background .1s,box-shadow .1s}
 .trun:hover{background:color-mix(in srgb,var(--accent) 18%,transparent);
   box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 50%,transparent)}
@@ -461,7 +464,7 @@ footer .dot{color:var(--line-2)}
       <a href="https://x.com/monkeymarxist" target="_blank" rel="noopener noreferrer">@monkeymarxist</a>
       <span class="dot">·</span>
       <a href="https://monkeymarxist.github.io/p2pchat/LICENSE.txt" target="_blank" rel="noopener noreferrer">AGPL-3.0</a>
-      <span class="mono" style="margin-left:auto;font-size:12px">Build 26</span>
+      <span class="mono" style="margin-left:auto;font-size:12px">Build 27</span>
     </footer>
   </div>
 </section>

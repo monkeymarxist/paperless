@@ -835,6 +835,7 @@ function mountEditor() {
       repaint(); select(a.id); renderSidePanel();
       toast('Picture lifted — drag to move, corner handle to resize');
     } catch (e) {
+      console.error('grabImage', e);
       toast('That picture could not be read.', true);
     } finally { setTimeout(() => progress(null), 300); }
   }
@@ -1228,7 +1229,7 @@ function mountEditor() {
     if (S.mode === 'edittext') {
       const edits = S.annots.filter(a => a.type === 'cover').length;
       side.append(h('p', { class: 'mono', style: 'font-size:12px;color:var(--ink-2);margin-bottom:14px' },
-        `${edits} block${edits === 1 ? '' : 's'} replaced \u00b7 build 26`));
+        `${edits} block${edits === 1 ? '' : 's'} replaced \u00b7 build 27`));
       side.append(h('div', { class: 'field' },
         h('label', null, 'Replacement size'),
         h('div', { class: 'seg' },
@@ -1813,8 +1814,12 @@ function mountEditor() {
 
   function dragLoop(e, onMove, onEnd) {
     const sx = e.clientX, sy = e.clientY;
-    const host = (e.currentTarget && e.currentTarget.setPointerCapture) ? e.currentTarget
-      : (e.target && e.target.setPointerCapture) ? e.target : null;
+    /* Capture on the stage, never on the thing being dragged. Selecting an object
+       repaints the layer before the drag starts, and every frame of the drag
+       rebuilds it again, so the element that received the pointerdown is already
+       detached — and capturing a detached element throws. That is why a picture
+       would not move at all and a resize stopped after one step. */
+    const host = $('#wb-stage') || null;
     if (host) {
       captureGesture(host, e, {
         move: ev => { const last = allSamples(ev).pop(); onMove(last.clientX - sx, last.clientY - sy); },
@@ -1876,11 +1881,25 @@ function mountEditor() {
     const ox = a.x, oy = a.y, opts = a.pts ? a.pts.map(p => p.slice()) : null;
     let moved = false;
     pushUndo();
+    /* Keep a grabbable piece of the object on the page. Dragged far enough, its
+       corner handle ends up off the stage or under the panel, and then it can
+       never be resized again — besides which, nothing off the page prints. */
+    const pg = S.doc.pages[a.page - 1];
+    const EDGE = 24;
     dragLoop(e, (dx, dy) => {
       moved = true;
-      const mx = dx / S.zoom, my = dy / S.zoom;
-      if (a.pts) a.pts = opts.map(p => [p[0] + mx, p[1] + my]);
-      else { a.x = ox + mx; a.y = oy + my; }
+      let mx = dx / S.zoom, my = dy / S.zoom;
+      if (a.pts) {
+        const xs = opts.map(q => q[0]), ys = opts.map(q => q[1]);
+        const bx = Math.min(...xs), by = Math.min(...ys);
+        const bw = Math.max(...xs) - bx, bh = Math.max(...ys) - by;
+        mx = clamp(bx + mx, -bw + EDGE, pg.w - EDGE) - bx;
+        my = clamp(by + my, -bh + EDGE, pg.h - EDGE) - by;
+        a.pts = opts.map(q => [q[0] + mx, q[1] + my]);
+      } else {
+        a.x = clamp(ox + mx, -(a.w || 0) + EDGE, pg.w - EDGE);
+        a.y = clamp(oy + my, -(a.h || 0) + EDGE, pg.h - EDGE);
+      }
       repaint();
     }, () => { if (!moved) S.undoStack.pop(); });
   }
@@ -3697,7 +3716,13 @@ function isPalm(ev) {
    the panel or past the window edge still arrives in one piece. */
 function captureGesture(el, ev, { move, end, cancel }) {
   const id = ev.pointerId;
-  try { el.setPointerCapture(id); } catch (e) { /* capture is best-effort */ }
+  let captured = false;
+  try { el.setPointerCapture(id); captured = true; } catch (e) { captured = false; }
+  /* Capture is refused on an element that is no longer in the document — and a
+     repaint detaches elements constantly. When it is refused, listen on the
+     window instead, which is always there; otherwise the gesture would get no
+     events at all. */
+  if (!captured) el = window;
   const onMove = e => { if (e.pointerId === id) move(e); };
   const finish = kind => e => {
     if (e && e.pointerId !== id) return;
@@ -3705,7 +3730,7 @@ function captureGesture(el, ev, { move, end, cancel }) {
     el.removeEventListener('pointerup', up);
     el.removeEventListener('pointercancel', cancelled);
     el.removeEventListener('lostpointercapture', cancelled);
-    try { el.releasePointerCapture(id); } catch (e2) {}
+    if (captured) { try { el.releasePointerCapture(id); } catch (e2) {} }
     if (kind === 'up') end && end(e);
     else (cancel || end) && (cancel || end)(e);
   };

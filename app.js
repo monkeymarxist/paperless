@@ -14,6 +14,11 @@ const h = (tag, attrs, ...kids) => {
   const n = document.createElement(tag);
   if (attrs) for (const k in attrs) {
     const v = attrs[k];
+    /* An aria- attribute is written even when it is false: aria-pressed="false"
+       is a meaningful state, and the styling keys on the literal "true". Passed
+       as a boolean it used to be dropped altogether, so every segmented control
+       in the side panel rendered with nothing chosen. */
+    if (k.startsWith('aria-')) { n.setAttribute(k, String(v)); continue; }
     if (v == null || v === false) continue;
     if (k === 'class') n.className = v;
     else if (k === 'html') n.innerHTML = v;
@@ -78,7 +83,10 @@ const SVG = {
   circle: '<circle cx="12" cy="12" r="8.5"/>',
   arrow:  '<path d="M4 20L20 4"/><path d="M13 4h7v7"/>',
   rub:    '<path d="M9.5 19H20"/><path d="M15.5 6.5l3 3a2 2 0 0 1 0 2.8L12 19H8l-3.2-3.2a2 2 0 0 1 0-2.8l7.9-7.9a2 2 0 0 1 2.8 0z"/>',
-  chev:   '<path d="M9 6l6 6-6 6"/>'
+  chev:   '<path d="M9 6l6 6-6 6"/>',
+  stamp:  '<path d="M8 13V8.5a4 4 0 1 1 8 0V13"/><path d="M5 13h14l1.6 5H3.4z"/><path d="M4 21h16"/>',
+  line:   '<path d="M4 20L20 4"/>',
+  callout:'<rect x="3" y="4" width="12" height="8" rx="1.5"/><path d="M15 12l5 7"/><path d="M20 19h-4m4 0v-4"/>'
 };
 function ico(name, cls) {
   const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -100,17 +108,41 @@ function toast(msg, bad) {
   setTimeout(() => t.remove(), bad ? 4600 : 3000);
 }
 
-function modal(build) {
+function modal(build, onClose) {
   const box = h('div', { class: 'sheetbox' });
   const back = $('#modal');
   clear(back).append(box);
   back.hidden = false;
-  const close = () => { back.hidden = true; clear(back); document.removeEventListener('keydown', esc); };
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    back.hidden = true; clear(back);
+    document.removeEventListener('keydown', esc);
+    /* Escape and a click on the backdrop close the sheet too, and nothing was
+       told about it — which is how the rail was left with Sign still pressed
+       after the signature pad was dismissed. */
+    if (onClose) { try { onClose(); } catch (e) {} }
+  };
   const esc = e => { if (e.key === 'Escape') close(); };
   document.addEventListener('keydown', esc);
   back.onclick = e => { if (e.target === back) close(); };
   build(box, close);
   return close;
+}
+
+/* A confirmation the app draws itself. window.confirm is refused outright in a
+   sandboxed frame — it returns false without ever asking — which is why
+   deleting a saved signature appeared to do nothing at all. */
+function confirmSheet(title, message, label, onYes) {
+  modal((box, close) => {
+    box.append(
+      h('h3', null, title),
+      h('p', null, message),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn', onclick: () => close() }, 'Cancel'),
+        h('button', { class: 'btn danger', onclick: () => { close(); onYes(); } }, label)));
+  });
 }
 
 /* --------------------------------------------------------- file delivery */
@@ -150,15 +182,40 @@ const S = {
   doc: null,          // {name, bytes, pdf, pages:[{n,w,h}]}
   tool: null,
   annots: [], undoStack: [], redoStack: [],
-  mode: 'select', sizeMode: 'match', ratioGroups: new Map(), cropping: null, sideClosed: false, overflow: 'shrink',
+  mode: 'select', sizeMode: 'match', ratioGroups: new Map(), cropping: null, sideClosed: false, overflow: 'wrap',   // let replacement text run on rather than shrink it
   fmt: { weight: null, italic: null, color: null, scale: 1 }, lastRun: null,
-  color: '#000000', fontSize: 16, fontName: 'Helvetica', strokeW: 2.5, rubberW: 14, penSeen: false, penOnly: true, cancelStroke: null, touches: 0,
+  drawSignature: null,              // the editor's signature pad, lent to the Stamp & sign sheet
+  color: '#000000', calloutColor: '#f01124', fontSize: 16,   // BRIGHT_PALETTE[0]; the palette is declared below this object
+  fontName: 'Helvetica', strokeW: 2.5, rubberW: 14,
+  penSeen: false, penOnly: true, cancelStroke: null, touches: 0,
   zoom: 1, sel: null,
-  pageEls: []
+  pageEls: [],
+  /* Mount lifecycle. Every tool is torn down by wbReset, which bumps `gen` and
+     runs whatever the mount registered for cleanup — its stage listeners, its
+     observers, the object URLs it made. An async job started under an earlier mount compares its own
+     generation against this one and stops rather than drawing over whatever is
+     on screen now. `keys` is what the keyboard shortcuts are allowed to do in
+     the tool that is actually mounted. */
+  gen: 0, cleanup: [], keys: null,
+  ink: [], inkVolatile: false      // the saved signature/stamp library
 };
+
+/* Register a teardown for the current mount. */
+function onCleanup(fn) { S.cleanup.push(fn); }
+
+/* A guard an async run can check before it touches the screen again:
+     const mine = ownsScreen();  …await…  if (!mine()) return;            */
+function ownsScreen() {
+  const g = S.gen, doc = S.doc;
+  return () => g === S.gen && doc === S.doc;
+}
 
 const PALETTE = ['#000000', '#6b615d', '#8a0f14', '#0a74b8', '#1a7f4f', '#d08700', '#ffffff'];
 const HL_PALETTE = ['#ffe44d', '#9cf27f', '#8fd4ff', '#ffb0d6', '#ffbb7a'];
+/* A comment is meant to be seen at a glance against the page it sits on, so it
+   gets its own palette with none of the muted inks in PALETTE — no black, no
+   grey, no near-maroon, and no white, which would vanish on paper. */
+const BRIGHT_PALETTE = ['#f01124', '#ff6a00', '#f5a300', '#00c853', '#0a84ff', '#7b3fe4', '#ff2d8e'];
 
 /* A finger is not a mouse: coarse pointers get bigger targets and fewer steps. */
 function coarsePointer() {
@@ -168,6 +225,17 @@ function coarsePointer() {
 function hex2rgb(x) {
   const m = x.replace('#', '');
   return rgb(parseInt(m.slice(0, 2), 16) / 255, parseInt(m.slice(2, 4), 16) / 255, parseInt(m.slice(4, 6), 16) / 255);
+}
+
+/* Blob URLs are not collected when the object holding them is dropped, so an
+   editing session that placed and removed a dozen pictures kept every one of
+   them alive. Data URLs (what the eraser hands back) need no release. */
+function releaseAnnotURLs(list) {
+  for (const a of list || []) {
+    if (a && typeof a.url === 'string' && a.url.startsWith('blob:')) {
+      try { URL.revokeObjectURL(a.url); } catch (e) {}
+    }
+  }
 }
 
 /* --------------------------------------------------------- document load */
@@ -180,6 +248,10 @@ async function setDoc(bytes, name) {
     pages.push({ n: i, w: vp.width, h: vp.height });
   }
   if (S.doc && S.doc.pdf) { try { S.doc.pdf.destroy(); } catch (e) {} }
+  /* Pictures placed on the old document held blob URLs. They have to outlive
+     their mount — switching tool and back keeps the annotations — so they are
+     released here instead, where the document they belonged to goes away. */
+  releaseAnnotURLs(S.annots);
   S.doc = { name, bytes, pdf, pages };
   S.annots = []; S.undoStack = []; S.redoStack = []; S.sel = null; S.ratioGroups = new Map();
   return S.doc;
@@ -207,13 +279,30 @@ async function openPdfFile(file) {
   }
 }
 
+/* Cancelling the file dialog fires no change event, so this promise used to
+   never settle: whoever awaited it waited for the life of the tab, and the tool
+   that was waiting — Add image, Sign, every "Choose a file" — stayed stuck with
+   its button pressed and had to be left and re-entered. The browsers that have
+   a cancel event answer straight away; the rest are caught when focus comes
+   back to the window with nothing chosen. */
 function pickFile(accept, multiple) {
   return new Promise(res => {
     const inp = $('#filein');
     inp.value = '';
     inp.accept = accept || '';
     inp.multiple = !!multiple;
-    inp.onchange = () => res(multiple ? Array.from(inp.files) : inp.files[0] || null);
+    let settled = false;
+    const done = v => {
+      if (settled) return;
+      settled = true;
+      inp.onchange = null; inp.oncancel = null;
+      window.removeEventListener('focus', onFocus);
+      res(v);
+    };
+    const onFocus = () => setTimeout(() => { if (!inp.files.length) done(multiple ? [] : null); }, 500);
+    inp.onchange = () => done(multiple ? Array.from(inp.files) : inp.files[0] || null);
+    inp.oncancel = () => done(multiple ? [] : null);
+    window.addEventListener('focus', onFocus, { once: true });
     inp.click();
   });
 }
@@ -233,9 +322,13 @@ function dropTarget(node, onFiles) {
 }
 
 /* -------------------------------------------------------------- rendering */
-async function renderToCanvas(pageNo, scale, canvas) {
+/* `exact` renders at the scale asked for and nothing else. Everything on screen
+   wants the extra device-pixel-ratio factor so it is sharp on a retina panel;
+   anything measured in dots per inch — OCR, the image exports — must not have
+   it, or it silently gets double what it asked for. */
+async function renderToCanvas(pageNo, scale, canvas, exact) {
   const p = await S.doc.pdf.getPage(pageNo);
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const dpr = exact ? 1 : Math.min(window.devicePixelRatio || 1, 2);
   const vp = p.getViewport({ scale: scale * dpr });
   canvas.width = Math.max(1, Math.floor(vp.width));
   canvas.height = Math.max(1, Math.floor(vp.height));
@@ -301,6 +394,12 @@ function applySidePanel() {
 }
 
 function wbReset() {
+  /* Anything still running under the outgoing tool now fails its ownsScreen()
+     check, so it stops instead of painting into the new tool's stage. */
+  S.gen++;
+  S.keys = null;
+  for (const fn of S.cleanup.splice(0)) { try { fn(); } catch (e) {} }
+  S.pageEls = [];
   clear($('#wb-stage'));
   const sd = $('#wb-side');
   clear(sd); sd.dataset.wanted = ''; sd.hidden = true;
@@ -357,6 +456,7 @@ function mountEditor() {
 
   const DRAW_KIDS = [
     { id: 'ink',     label: 'Pen',     icon: 'pen' },
+    { id: 'line',    label: 'Line',    icon: 'line' },
     { id: 'rect',    label: 'Box',     icon: 'rect' },
     { id: 'ellipse', label: 'Circle',  icon: 'circle' },
     { id: 'arrow',   label: 'Arrow',   icon: 'arrow' },
@@ -369,9 +469,10 @@ function mountEditor() {
     { id: 'text',   label: 'Add text',   icon: 'type' },
     { id: 'hl',     label: 'Mark',   icon: 'hl' },
     { id: 'draw',   label: 'Draw',   icon: 'pen', kids: DRAW_KIDS },
+    { id: 'callout', label: 'Comment', icon: 'callout' },
     { id: 'picture', label: 'Edit image', icon: 'image' },
     { id: 'img',    label: 'Add image', icon: 'plus' },
-    { id: 'sign',   label: 'Sign',   icon: 'sign' }
+    { id: 'seal',   label: 'Stamp & sign', icon: 'stamp' }
   ];
   let drawOpen = DRAW_IDS.includes(S.mode);
   for (const m of MODES) {
@@ -425,7 +526,21 @@ function mountEditor() {
       head.setAttribute('aria-expanded', drawOpen);
     }
     const drawer = rail.querySelector('.subrail');
-    if (drawer) drawer.classList.toggle('open', drawOpen);
+    if (drawer) {
+      drawer.classList.toggle('open', drawOpen);
+      /* At phone width the rail runs across and scrolls sideways, so a drawer
+         that opens near the right-hand end puts four of its five tools past
+         the edge with nothing to say they are there. Bring the far end of it
+         into view once the slide has finished. */
+      if (drawOpen) {
+        setTimeout(() => {
+          const last = drawer.querySelector('.trb-sub:last-child');
+          if (last && rail.scrollWidth > rail.clientWidth + 4) {
+            last.scrollIntoView({ block: 'nearest', inline: 'end', behavior: 'smooth' });
+          }
+        }, 270);
+      }
+    }
   }
   syncRail();
 
@@ -442,7 +557,24 @@ function mountEditor() {
   renderSidePanel();
   fitZoom();
 
-  const DRAW_MODES = ['ink', 'rect', 'ellipse', 'arrow', 'rub', 'hl', 'text'];
+  /* What the keyboard is allowed to do while this tool is the one on screen.
+     Anything not listed here simply does not respond, which is why Cmd+Z no
+     longer reaches into another tool's action bar and presses whatever happens
+     to be first. */
+  S.keys = {
+    undo, redo,
+    remove: () => {
+      if (!S.sel) return;
+      pushUndo();
+      const gone = S.annots.filter(x => x.id === S.sel);
+      S.annots = S.annots.filter(x => x.id !== S.sel);
+      releaseAnnotURLs(gone);
+      S.sel = null;
+      repaint(); renderSidePanel();
+    }
+  };
+
+  const DRAW_MODES = ['ink', 'line', 'rect', 'ellipse', 'arrow', 'callout', 'rub', 'hl', 'text'];
   function setMode(m) {
     S.mode = m;
     // while a drawing tool is up the page must not pan under the pointer
@@ -451,14 +583,34 @@ function mountEditor() {
     else rail.querySelectorAll('.trb').forEach(b => b.setAttribute('aria-pressed', b.dataset.mode === m));
     if (m !== 'select') select(null);
     renderSidePanel();
+    /* Only the pages on screen get their layer built. Doing the lot here meant
+       choosing Edit text rendered every page of the document in one go; the
+       observer picks up the rest as they scroll into view. */
     for (const r of S.pageEls) {
       r.tlayer.hidden = m !== 'edittext';
       r.ilayer.hidden = m !== 'picture';
+      if (!nearView(r)) continue;
       if (m === 'edittext') buildTextLayer(r);
       if (m === 'picture') buildImageLayer(r);
     }
+    /* Whether an object can be clicked depends on the mode, and that is baked
+       into each element when it is drawn. Without a repaint here the objects
+       kept the previous mode's setting: after adding a text box and switching
+       to Select, every object on the page was still pointer-events:none, so
+       nothing could be selected, dragged or re-opened until some other action
+       happened to redraw the layer. */
+    repaint();
     if (m === 'img') insertImage();
     if (m === 'sign') signatureDialog();
+    if (m === 'seal' && !S.ink.length && !S.pendingSig) sealDialog('signature', () => renderSidePanel());
+  }
+
+  /* Is this page on screen, or close enough to it to be worth preparing? */
+  function nearView(rec) {
+    const stage = $('#wb-stage');
+    if (!stage || !rec.box.isConnected) return false;
+    const a = rec.box.getBoundingClientRect(), b = stage.getBoundingClientRect();
+    return a.bottom > b.top - 400 && a.top < b.bottom + 400;
   }
 
   /* ---- editing the document's own text ---- */
@@ -468,10 +620,7 @@ function mountEditor() {
     try {
       // colours and ink heights are read off the rendered page, so it has to
       // exist first — pages below the fold are still lazy at this point
-      if (!rec.rendered || !rec.canvas.width) {
-        rec.rendered = true;
-        await renderToCanvas(rec.pg.n, Math.max(1.6, S.zoom), rec.canvas);
-      }
+      await ensureRendered(rec, 1.6);
       const page = await S.doc.pdf.getPage(rec.pg.n);
       const vp = page.getViewport({ scale: 1 });
       const tc = await page.getTextContent();
@@ -502,10 +651,26 @@ function mountEditor() {
       const m = pdfjsLib.Util.transform(vp.transform, it.transform);
       const size = Math.hypot(m[2], m[3]) || Math.hypot(m[0], m[1]);
       if (!size || size < 2) continue;
-      if (Math.abs(Math.atan2(m[1], m[0])) > 0.08) continue;   // skip rotated runs
+      /* Skip runs that are turned relative to THIS page, rather than every run
+         at an angle: on a page the file itself rotates, the viewport has
+         already turned the text upright, and a fixed test against zero threw
+         the whole page away. */
+      const ang = Math.atan2(m[1], m[0]);
       let real = '';
       try { if (page.commonObjs.has(it.fontName)) real = page.commonObjs.get(it.fontName).name || ''; } catch (e) {}
-      raw.push({ x: m[4], baseline: m[5], w: it.width || size * it.str.length * 0.5, size, str: it.str, face: real || it.fontName || '' });
+      raw.push({ x: m[4], baseline: m[5], w: it.width || size * it.str.length * 0.5, size, str: it.str, face: real || it.fontName || '', ang });
+    }
+    {
+      const tally = new Map();
+      for (const r of raw) {
+        const q = Math.round(r.ang / (Math.PI / 2)) * (Math.PI / 2);
+        tally.set(q, (tally.get(q) || 0) + r.str.length);
+      }
+      let base = 0, bestN = -1;
+      for (const [q, n] of tally) if (n > bestN) { bestN = n; base = q; }
+      const kept = raw.filter(r => Math.abs(r.ang - base) < 0.08);
+      raw.length = 0;
+      raw.push(...kept);
     }
     raw.sort((a, b) => (a.baseline - b.baseline) || (a.x - b.x));
     const lines = [];
@@ -610,9 +775,29 @@ function mountEditor() {
 
   function beginRunEdit(rec, r, node, ev) {
     if (node.classList.contains('editing')) return;
+    /* Clicking straight from one paragraph to another used to lose the second
+       one: the first editor's blur commits, committing repaints the whole text
+       layer, and that repaint tore out the node this call was halfway through
+       setting up. Close the open editor, wait for the commit it starts, then
+       open the paragraph that was clicked — by position, since the node handed
+       to us no longer exists by then. */
+    const live = rec.tlayer.querySelector('.trun.editing');
+    if (live && live !== node) {
+      const idx = [...rec.tlayer.children].indexOf(node);
+      live.blur();
+      Promise.resolve(rec.editDone).then(() => {
+        const again = idx >= 0 ? rec.tlayer.children[idx] : null;
+        if (again && again.classList.contains('trun')) beginRunEdit(rec, r, again, ev);
+      });
+      return;
+    }
     const z = S.zoom;
-    const font = r.font || guessStdFont(r.face);
-    const size = r.fit != null ? r.fit : r.size;
+    /* Show exactly what the commit will write. The editor used to preview the
+       document's own face, size and colour while applyRunEdit committed the
+       side panel's overrides, so the typeface, weight, size and colour you
+       typed in were not the ones you got. */
+    const font = withFmt(r.font || guessStdFont(r.face));
+    const size = +(((r.fit != null ? r.fit : r.size)) * (S.fmt.scale || 1)).toFixed(2);
     const fam = fontCss(font), wt = /Bold/.test(font) ? '700' : '400';
     const st = /Italic|Oblique/.test(font) ? 'italic' : 'normal';
     if (!r.probe) r.probe = sampleRun(rec.canvas, rec.pg.w, rec.pg.h, runBox(r));
@@ -620,20 +805,21 @@ function mountEditor() {
     const was = { w: r.w, dx: r.dx || 0, dy: r.dy || 0 };   // moving or re-wrapping counts as an edit too
     node.classList.add('editing');
     node.style.background = r.probe.bg;
-    node.style.color = r.probe.fg;
+    const ink = S.fmt.color || r.probe.fg;
+    node.style.color = ink;
     node.style.fontSize = (size * z) + 'px';
     node.style.lineHeight = (r.lineH * z) + 'px';     // the document's own leading
     node.style.fontFamily = fam;
     node.style.fontWeight = wt;
     node.style.fontStyle = st;
     node.style.textShadow = ((S.fmt.weight || r.weight) === 'semi')
-      ? (size * z * 0.038).toFixed(2) + 'px 0 0 ' + r.probe.fg : '';
+      ? (size * z * 0.038).toFixed(2) + 'px 0 0 ' + ink : '';
     node.style.whiteSpace = 'pre-wrap';               // wrap inside the block
     node.style.width = (r.w * z) + 'px';
     node.style.height = 'auto';
     node.style.minHeight = (r.h * z) + 'px';
     node.style.left = ((r.x + (r.dx || 0) - 1) * z) + 'px';
-    node.style.top = ((r.baseline + (r.dy || 0) - size * baselineEm(fam, wt, st)) * z) + 'px';
+    node.style.top = ((r.baseline + (r.dy || 0) - size * baselineEm(fam, wt, st, r.lineH / size)) * z) + 'px';
     node.dataset.keep = JSON.stringify(keep);
     S.lastRun = r;
     renderSidePanel();
@@ -665,7 +851,8 @@ function mountEditor() {
     }
 
     // a bar along the top drags the whole block, words and all
-    const mover = h('span', { class: 'movebar', title: 'Drag to move this text' });
+    // same reasoning as the resize handle: these sit inside an editable element
+    const mover = h('span', { class: 'movebar', title: 'Drag to move this text', contenteditable: 'false' });
     mover.addEventListener('pointerdown', e => {
       e.stopImmediatePropagation(); e.preventDefault();
       const ox = r.dx || 0, oy = r.dy || 0, sx = e.clientX, sy = e.clientY;
@@ -673,20 +860,24 @@ function mountEditor() {
         r.dx = ox + (mv.clientX - sx) / S.zoom;
         r.dy = oy + (mv.clientY - sy) / S.zoom;
         node.style.left = ((r.x + r.dx - 1) * S.zoom) + 'px';
-        node.style.top = ((r.baseline + r.dy - size * baselineEm(fam, wt, st)) * S.zoom) + 'px';
+        node.style.top = ((r.baseline + r.dy - size * baselineEm(fam, wt, st, r.lineH / size)) * S.zoom) + 'px';
       };
       const up = () => {
         window.removeEventListener('pointermove', move);
         window.removeEventListener('pointerup', up);
+        window.removeEventListener('pointercancel', up);
+        window.removeEventListener('blur', up);
         node.focus();
       };
       window.addEventListener('pointermove', move);
       window.addEventListener('pointerup', up);
+      window.addEventListener('pointercancel', up);
+      window.addEventListener('blur', up);
     });
     node.append(mover);
 
     // a handle on the right edge sets where the text wraps
-    const grip = h('span', { class: 'wrapgrip', title: 'Drag to set the wrap width' });
+    const grip = h('span', { class: 'wrapgrip', title: 'Drag to set the wrap width', contenteditable: 'false' });
     grip.addEventListener('pointerdown', e => {
       e.stopImmediatePropagation(); e.preventDefault();
       const w0 = r.w, sx = e.clientX;
@@ -697,10 +888,14 @@ function mountEditor() {
       const up = () => {
         window.removeEventListener('pointermove', move);
         window.removeEventListener('pointerup', up);
+        window.removeEventListener('pointercancel', up);
+        window.removeEventListener('blur', up);
         node.focus();
       };
       window.addEventListener('pointermove', move);
       window.addEventListener('pointerup', up);
+      window.addEventListener('pointercancel', up);
+      window.addEventListener('blur', up);
     });
     node.append(grip);
 
@@ -723,9 +918,11 @@ function mountEditor() {
       node.style.width = keptStyle.w || '';
       const moved = Math.abs((r.dx || 0) - was.dx) > 0.3 || Math.abs((r.dy || 0) - was.dy) > 0.3;
       const rewrapped = Math.abs(r.w - was.w) > 0.5;
+      /* Hand the commit back as a promise so that opening another paragraph can
+         wait for this one to finish before it starts. */
       if (kept && (next !== r.str || moved || rewrapped))
-        applyRunEdit(rec, r, next).catch(() => toast('That text could not be replaced.', true));
-      else paintTextLayer(rec);
+        rec.editDone = applyRunEdit(rec, r, next).catch(() => toast('That text could not be replaced.', true));
+      else { paintTextLayer(rec); rec.editDone = Promise.resolve(); }
     };
     node.addEventListener('blur', () => finish(true), { once: true });
     node.addEventListener('keydown', e2 => {
@@ -747,10 +944,7 @@ function mountEditor() {
     if (rec.imgs) { paintImageLayer(rec); return; }
     rec.imgs = [];
     try {
-      if (!rec.rendered || !rec.canvas.width || rec.canvas.width < 60) {
-        rec.rendered = true;
-        await renderToCanvas(rec.pg.n, Math.max(1.6, S.zoom), rec.canvas);
-      }
+      await ensureRendered(rec, 1.6);
       const page = await S.doc.pdf.getPage(rec.pg.n);
       const vp = page.getViewport({ scale: 1 });
       const ops = await page.getOperatorList();
@@ -787,8 +981,6 @@ function mountEditor() {
     }
   }
 
-  const cssFilter = f => `brightness(${f.b}%) contrast(${f.c}%) saturate(${f.s}%) grayscale(${f.g}%)`;
-
   /* Lift a page image into an editable object by re-rendering just that region
      at high resolution. The original stays underneath, covered. */
   async function grabImage(rec, rect) {
@@ -812,7 +1004,7 @@ function mountEditor() {
       out.height = Math.max(1, Math.round(rect.h * scale));
       out.getContext('2d').drawImage(full, Math.round(rect.x * scale), Math.round(rect.y * scale),
         out.width, out.height, 0, 0, out.width, out.height);
-      const blob = await new Promise(r => out.toBlob(r, 'image/jpeg', 0.92));
+      const blob = await toBlobOrThrow(out, 'image/jpeg', 0.92);
       const bytes = new Uint8Array(await blob.arrayBuffer());
       pushUndo();
       // Patch out the original first. Without this, moving or shrinking the copy
@@ -853,7 +1045,7 @@ function mountEditor() {
     if (deg) c.rotate(deg * Math.PI / 180);
     c.scale(flipH ? -1 : 1, flipV ? -1 : 1);
     c.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
-    const blob = await new Promise(r => cv.toBlob(r, a.fmt === 'png' ? 'image/png' : 'image/jpeg', 0.92));
+    const blob = await toBlobOrThrow(cv, a.fmt === 'png' ? 'image/png' : 'image/jpeg', 0.92);
     pushUndo();
     a.url = URL.createObjectURL(blob);
     a.bytes = new Uint8Array(await blob.arrayBuffer());
@@ -875,7 +1067,7 @@ function mountEditor() {
         Math.round(img.naturalWidth * c.x), Math.round(img.naturalHeight * c.y),
         cv.width, cv.height, 0, 0, cv.width, cv.height);
       const png = a.fmt === 'png';
-      const blob = await new Promise(r => cv.toBlob(r, png ? 'image/png' : 'image/jpeg', 0.92));
+      const blob = await toBlobOrThrow(cv, png ? 'image/png' : 'image/jpeg', 0.92);
       pushUndo();
       a.x += a.w * c.x; a.y += a.h * c.y;
       a.w *= c.w; a.h *= c.h;
@@ -939,7 +1131,7 @@ function mountEditor() {
         Math.round(img.naturalWidth * c.x), Math.round(img.naturalHeight * c.y),
         cv.width, cv.height, 0, 0, cv.width, cv.height);
       const png = a.fmt === 'png';
-      const blob = await new Promise(r => cv.toBlob(r, png ? 'image/png' : 'image/jpeg', 0.92));
+      const blob = await toBlobOrThrow(cv, png ? 'image/png' : 'image/jpeg', 0.92);
       pushUndo();
       a.x += a.w * c.x; a.y += a.h * c.y;
       a.w *= c.w; a.h *= c.h;
@@ -1049,7 +1241,15 @@ function mountEditor() {
 
     let metrics = null;
     try { metrics = await stdFont(font); } catch (e) {}
-    const rowsAt = sz => metrics ? wrapText(next, metrics, sz, r.w)
+    /* Lay the replacement out against the run's width — but never against a
+       width too narrow to hold a word. A short run (a page number, a date, one
+       word of a heading) is only a few points wide, and wrapping a longer
+       replacement into it put ONE CHARACTER on each line; those breaks are then
+       baked into the object's text as real newlines, so what landed on the page
+       was a column of letters running down it. This is where the vertical text
+       came from. */
+    const wrapW = sz => Math.max(r.w, minTextWidth({ size: sz }));
+    const rowsAt = sz => metrics ? wrapText(next, metrics, sz, wrapW(sz))
                                  : String(next).split('\n');
 
     let laid = rowsAt(size);
@@ -1095,7 +1295,8 @@ function mountEditor() {
       const t = {
         id: uid(), type: 'text', page: rec.pg.n,
         x: r.x + (r.dx || 0), y: r.baseline + (r.dy || 0) - size * 0.82,
-        w: r.w + size * 0.6, lh: size * lead,
+        // the box has to be at least as wide as the text was laid out to be
+        w: Math.max(r.w + size * 0.6, minTextWidth({ size })), lh: size * lead,
         text: body, size, color: S.fmt.color || probe.fg, font,
         weight: S.fmt.weight || r.weight || 'regular'
       };
@@ -1126,7 +1327,19 @@ function mountEditor() {
           onchange: e => { pushUndo(); a.font = e.target.value; repaint(); }
         }, ...['Helvetica', 'HelveticaBold', 'HelveticaOblique', 'TimesRoman', 'TimesRomanBold', 'TimesRomanItalic', 'Courier', 'CourierBold'].map(f =>
           h('option', { value: f, selected: a.font === f }, f.replace(/([a-z])([A-Z])/g, '$1 $2'))))));
-        side.append(sizeRow('Size', a.size, 6, 72, v => { a.size = v; repaint(); }));
+        side.append(sizeRow('Size', a.size, 6, 72, v => {
+          /* Grow the box with the type. Setting the size on its own left the
+             width where it was, so turning 16pt into 72pt inside a 260pt box
+             put one word on each line — and one letter per line for a word
+             too long to fit. */
+          const pg = S.doc.pages[a.page - 1];
+          const k = v / Math.max(1, a.size);
+          a.size = v;
+          const room = pg ? pg.w - 8 : a.w * k;
+          a.w = clamp(a.w * k, minTextWidth(a), Math.max(minTextWidth(a), room));
+          if (pg && a.x + a.w > pg.w - 4) a.x = Math.max(4, pg.w - 4 - a.w);
+          repaint();
+        }));
       }
       if (a.type === 'img') {
         a.filter = a.filter || { b: 100, c: 100, s: 100, g: 0 };
@@ -1199,16 +1412,19 @@ function mountEditor() {
             } }, 'Delete')));
         return;
       }
-      if (['ink', 'rect', 'ellipse', 'arrow'].includes(a.type)) side.append(sizeRow('Stroke', a.strokeW, 1, 14, v => { a.strokeW = v; repaint(); }));
-      if (a.type !== 'img') side.append(colorField(a.type === 'hl' ? HL_PALETTE : PALETTE, a.color, c => { pushUndo(); a.color = c; repaint(); renderSidePanel(); }));
+      if (['ink', 'line', 'rect', 'ellipse', 'arrow', 'callout'].includes(a.type)) side.append(sizeRow('Stroke', a.strokeW, 1, 14, v => { a.strokeW = v; repaint(); }));
+      if (a.type !== 'img') side.append(colorField(
+        a.type === 'hl' ? HL_PALETTE : a.type === 'callout' ? BRIGHT_PALETTE : PALETTE, a.color,
+        c => { pushUndo(); a.color = c; if (a.type === 'callout') S.calloutColor = c; repaint(); renderSidePanel(); }));
       side.append(h('button', { class: 'btn danger sm', style: 'width:100%;justify-content:center', onclick: () => { pushUndo(); S.annots = S.annots.filter(x => x.id !== a.id); select(null); repaint(); } }, ico('trash'), 'Delete object'));
       side.append(h('p', { class: 'hint', style: 'font-size:11.5px;color:var(--ink-3);margin-top:12px' }, 'Drag to move. Use the corner handle to resize. Backspace deletes.'));
       return;
     }
 
     const names = { select: 'Select', edittext: 'Edit text', picture: 'Edit image', text: 'Add text', hl: 'Mark',
-      ink: 'Pen', rect: 'Box', ellipse: 'Circle', arrow: 'Arrow', rub: 'Eraser', img: 'Image', sign: 'Sign' };
-    side.append(h('div', { class: 'pane-h' }, names[S.mode] + ' tool'));
+      ink: 'Pen', line: 'Line', rect: 'Box', ellipse: 'Circle', arrow: 'Arrow', callout: 'Comment', rub: 'Eraser', img: 'Image',
+      sign: 'Sign', seal: 'Stamp & sign' };
+    if (S.mode !== 'seal') side.append(h('div', { class: 'pane-h' }, names[S.mode] + ' tool'));
     const tips = {
       select: 'Click an object to move or resize it.',
       edittext: 'Click a paragraph and type. Bar above it moves the block, grip on the right re-wraps it. Ctrl/\u2318+Enter commits, Escape cancels.',
@@ -1217,14 +1433,17 @@ function mountEditor() {
       ink:    'Draw freehand.',
       rect:   'Drag to draw a box.',
       ellipse:'Drag to draw a circle or an oval.',
-      arrow:  'Drag from the tail to the point.',
+      line:   'Drag to draw a straight line. Hold Shift to keep it level or upright.',
+      arrow:  'Drag from the tail to the point. Hold Shift to snap to 45\u00b0.',
+      callout:'Drag from the thing you want to point at out to where the note should sit, then type.',
       rub:    'Drag over your own marks to rub them out.',
       picture:'Click a picture to lift it out, then move, crop or send it to another app.',
       img:    'Place a PNG, JPEG or WebP, then drag to size it.',
       sign:   'Draw your signature once, place it on any page.',
+      seal:   'Keep your signatures and stamps here, and put them on any page.',
       erase:  'Click anything you added to remove it.'
     };
-    side.append(h('p', { style: 'font-size:13px;color:var(--ink-2);margin-bottom:14px' }, tips[S.mode]));
+    if (S.mode !== 'seal') side.append(h('p', { style: 'font-size:13px;color:var(--ink-2);margin-bottom:14px' }, tips[S.mode]));
 
     if (S.mode === 'edittext') {
       const edits = S.annots.filter(a => a.type === 'cover').length;
@@ -1316,7 +1535,11 @@ function mountEditor() {
       side.append(colorField(PALETTE, S.color, c => { S.color = c; renderSidePanel(); }));
     }
     if (S.mode === 'hl') side.append(colorField(HL_PALETTE, HL_PALETTE.includes(S.color) ? S.color : HL_PALETTE[0], c => { S.color = c; renderSidePanel(); }));
-    if (S.mode === 'ink' || S.mode === 'rect' || S.mode === 'ellipse' || S.mode === 'arrow') {
+    if (S.mode === 'callout') {
+      side.append(sizeRow('Size', S.fontSize, 6, 72, v => S.fontSize = v));
+      side.append(sizeRow('Stroke', S.strokeW, 1, 14, v => S.strokeW = v));
+      side.append(colorField(BRIGHT_PALETTE, S.calloutColor, c => { S.calloutColor = c; renderSidePanel(); }));
+    } else if (['ink', 'line', 'rect', 'ellipse', 'arrow'].includes(S.mode)) {
       side.append(sizeRow('Stroke', S.strokeW, 1, 14, v => S.strokeW = v));
       side.append(colorField(PALETTE, S.color, c => { S.color = c; renderSidePanel(); }));
     }
@@ -1330,6 +1553,37 @@ function mountEditor() {
           ? 'A finger or a resting palm scrolls the page instead of drawing.'
           : 'A finger draws too.')));
     }
+    if (S.mode === 'seal') {
+      side.append(h('div', { class: 'pane-h' }, 'Stamp & sign'));
+      side.append(h('p', { class: 'hint' },
+        'Photograph a signature or a rubber stamp on white paper. The paper is removed and the ink kept, with its own colour and no white box around it.'));
+      const strip = h('div', { class: 'inkrow' });
+      if (!(S.ink || []).length) {
+        strip.append(h('p', { class: 'hint', style: 'margin:4px 0' }, 'Nothing saved yet.'));
+      } else {
+        for (const a of S.ink) {
+          strip.append(h('div', { class: 'inkitem' },
+            h('button', {
+              class: 'inkcard checker', title: 'Place ' + a.name,
+              onclick: () => placeSaved(a)
+            }, h('img', { src: a.data, alt: a.name })),
+            h('span', { class: 'inkname', title: a.name }, a.name),
+            h('button', {
+              class: 'inkdel', title: 'Delete ' + a.name, 'aria-label': 'Delete ' + a.name,
+              onclick: () => removeInk(a)
+            }, ico('trash'))));
+        }
+      }
+      side.append(strip);
+      side.append(h('div', { class: 'grid2', style: 'margin-top:10px' },
+        h('button', { class: 'btn sm', onclick: () => sealDialog('signature', () => renderSidePanel()) }, ico('scan'), 'From a photo'),
+        h('button', { class: 'btn sm', onclick: () => signatureDialog() }, ico('sign'), 'Draw')));
+      side.append(h('p', { class: 'hint', style: 'margin-top:10px' },
+        S.inkVolatile
+          ? 'This browser will not keep saved ink, so the library lasts for this session only.'
+          : 'Saved in this browser only \u2014 never uploaded.'));
+    }
+
     if (S.mode === 'rub') {
       side.append(sizeRow('Rubber', S.rubberW, 4, 48, v => { S.rubberW = v; renderSidePanel(); }));
       side.append(h('p', { class: 'hint' },
@@ -1380,20 +1634,26 @@ function mountEditor() {
       const ilayer = h('div', { class: 'tlayer ilayer', hidden: true });
       box.append(canvas, layer, tlayer, ilayer, h('span', { class: 'pgnum' }, 'Page ' + pg.n + ' / ' + S.doc.pages.length));
       sheet.append(box);
-      S.pageEls.push({ pg, box, canvas, layer, tlayer, ilayer, rendered: false, runs: null, imgs: null });
+      S.pageEls.push({ pg, box, canvas, layer, tlayer, ilayer, renderTask: null, painted: false, runs: null, imgs: null });
       bindLayer(layer, pg);
     }
     stage.append(sheet);
     applyZoom();
     observeRender();
-    stage.addEventListener('pointerdown', e => {
+    /* The stage element itself survives a re-mount — only its children are
+       cleared — so a listener left on it here was still live the next time the
+       editor was opened, and a session that moved between tools a few times had
+       the same handler running several times over. */
+    const clearSel = e => {
       /* Only the Select tool cares about clearing the selection, and it is the
          one place where a repaint here is harmless. With a drawing tool up this
          fired on every stroke, repainting the layer out from under the live
          preview — which is why the rubber stopped showing where it was. */
       if (S.mode !== 'select') return;
       if (!e.target.closest('.an') && !e.target.closest('.handle')) select(null);
-    });
+    };
+    stage.addEventListener('pointerdown', clearSel);
+    onCleanup(() => stage.removeEventListener('pointerdown', clearSel));
   }
 
   /* On a tablet the page still has to be navigable while a pen tool is live, so
@@ -1428,7 +1688,7 @@ function mountEditor() {
     };
     const schedule = () => { if (!frame) frame = requestAnimationFrame(apply); };
 
-    stage.addEventListener('pointerdown', e => {
+    const onDown = e => {
       if (e.pointerType !== 'touch') return;
       live.set(e.pointerId, { x: e.clientX, y: e.clientY });
       S.touches = live.size;
@@ -1444,15 +1704,15 @@ function mountEditor() {
         // the pencil draws, so a finger is for getting around
         gesture = { single: true, x0: e.clientX, y0: e.clientY, sl: stage.scrollLeft, st: stage.scrollTop };
       }
-    }, true);
+    };
 
-    stage.addEventListener('pointermove', e => {
+    const onMove = e => {
       if (e.pointerType !== 'touch') return;
       const p = live.get(e.pointerId);
       if (!p) return;
       p.x = e.clientX; p.y = e.clientY;
       if (gesture) { if (e.cancelable) e.preventDefault(); schedule(); }
-    }, true);
+    };
 
     const drop = e => {
       if (e.pointerType !== 'touch') return;
@@ -1464,8 +1724,36 @@ function mountEditor() {
         gesture = { single: true, x0: ps[0].x, y0: ps[0].y, sl: stage.scrollLeft, st: stage.scrollTop };
       }
     };
+    stage.addEventListener('pointerdown', onDown, true);
+    stage.addEventListener('pointermove', onMove, true);
     stage.addEventListener('pointerup', drop, true);
     stage.addEventListener('pointercancel', drop, true);
+    onCleanup(() => {
+      stage.removeEventListener('pointerdown', onDown, true);
+      stage.removeEventListener('pointermove', onMove, true);
+      stage.removeEventListener('pointerup', drop, true);
+      stage.removeEventListener('pointercancel', drop, true);
+      if (frame) cancelAnimationFrame(frame);
+      live.clear();
+      S.touches = 0;
+    });
+  }
+
+  /* Make sure this page's canvas actually holds the page.
+
+     `rec.rendered` only ever meant "a render was started", and a fresh canvas
+     is 300×150, not 0 — so the old `!rec.canvas.width` guard never fired and
+     the colour sampler happily read the blank default. Both the flag and the
+     promise are kept here, so a caller can wait for a render someone else
+     began rather than starting a second one over the top. */
+  function ensureRendered(rec, minScale) {
+    if (rec.painted) return rec.renderTask || Promise.resolve();
+    if (!rec.renderTask) {
+      rec.renderTask = renderToCanvas(rec.pg.n, Math.max(minScale || 1.2, S.zoom), rec.canvas)
+        .then(c => { rec.painted = true; return c; })
+        .catch(e => { rec.renderTask = null; throw e; });
+    }
+    return rec.renderTask;
   }
 
   function observeRender() {
@@ -1473,13 +1761,18 @@ function mountEditor() {
       for (const en of entries) {
         if (!en.isIntersecting) continue;
         const rec = S.pageEls.find(r => r.box === en.target);
-        if (rec && !rec.rendered) {
-          rec.rendered = true;
-          renderToCanvas(rec.pg.n, Math.max(1.2, S.zoom), rec.canvas).catch(() => {});
-        }
+        if (!rec) continue;
+        ensureRendered(rec, 1.2).catch(() => {});
+        /* A page that scrolls into view while Edit text or Edit image is up
+           needs its layer built now. Building all of them the moment the mode
+           was chosen rendered the whole document at once, which on anything
+           long locked the tab for several seconds. */
+        if (S.mode === 'edittext') buildTextLayer(rec);
+        else if (S.mode === 'picture') buildImageLayer(rec);
       }
     }, { root: $('#wb-stage'), rootMargin: '400px' });
     S.pageEls.forEach(r => io.observe(r.box));
+    onCleanup(() => io.disconnect());
   }
 
   function applyZoom() {
@@ -1513,12 +1806,15 @@ function mountEditor() {
     const base = { class: 'an' + (S.sel === a.id ? ' sel' : ''), 'data-id': a.id };
     let n;
     if (a.type === 'text') {
+      // repair the box before it is measured, not after it has drawn wrongly
+      const pg = S.doc && S.doc.pages[a.page - 1];
+      fixTextBox(a, pg ? pg.w : null);
       n = h('div', Object.assign(base, { class: base.class + ' an-text' }));
       const fam = fontCss(a.font);
       const wt = /Bold/.test(a.font) ? 700 : 400;
       const st = /Italic|Oblique/.test(a.font) ? 'italic' : 'normal';
       // place the element so its FIRST BASELINE lands where the PDF will draw it
-      const top = a.y + a.size * 0.82 - a.size * baselineEm(fam, wt, st);
+      const top = a.y + a.size * 0.82 - a.size * baselineEm(fam, wt, st, (a.lh || a.size * 1.22) / a.size);
       n.style.cssText = `left:${a.x * z}px;top:${top * z}px;width:${a.w * z}px;color:${a.color};` +
         `font-size:${a.size * z}px;font-family:${fam};font-weight:${wt};font-style:${st};` +
         `line-height:${(a.lh || a.size * 1.22) * z}px;white-space:pre-wrap` +
@@ -1535,7 +1831,7 @@ function mountEditor() {
       n = h('div', base);
       n.style.cssText = `left:${a.x * z}px;top:${a.y * z}px;width:${a.w * z}px;height:${a.h * z}px;` +
         `border:${Math.max(1, a.strokeW * z)}px solid ${a.color};border-radius:50%`;
-    } else if (a.type === 'arrow' || a.type === 'erase') {
+    } else if (a.type === 'arrow' || a.type === 'line' || a.type === 'erase') {
       const b = shapeBox(a);
       const pad = (a.type === 'erase' ? a.strokeW : Math.max(a.strokeW * 3, 10)) + 4;
       n = h('div', base);
@@ -1551,6 +1847,9 @@ function mountEditor() {
         path.setAttribute('d', a.pts.map((q, i) => (i ? 'L' : 'M') + q[0].toFixed(2) + ' ' + q[1].toFixed(2)).join(' '));
         path.setAttribute('stroke', 'var(--mark)');
         path.setAttribute('stroke-opacity', '0.35');
+      } else if (a.type === 'line') {
+        path.setAttribute('d', `M${a.x} ${a.y} L${a.x + a.w} ${a.y + a.h}`);
+        path.setAttribute('stroke', a.color);
       } else {
         const hd = arrowHead(a);
         path.setAttribute('d',
@@ -1567,6 +1866,51 @@ function mountEditor() {
     } else if (a.type === 'cover') {
       n = h('div', base);
       n.style.cssText = `left:${a.x * z}px;top:${a.y * z}px;width:${a.w * z}px;height:${a.h * z}px;background:${a.color}`;
+    } else if (a.type === 'callout') {
+      const g = calloutGeom(a);
+      const pad = Math.max(a.strokeW * 3, 10) + 4;
+      n = h('div', Object.assign(base, { class: base.class + ' an-callout' }));
+      n.style.cssText = `left:${(g.box.x - pad) * z}px;top:${(g.box.y - pad) * z}px;` +
+        `width:${(g.box.w + pad * 2) * z}px;height:${(g.box.h + pad * 2) * z}px`;
+      const NS = 'http://www.w3.org/2000/svg';
+      const svg = document.createElementNS(NS, 'svg');
+      svg.setAttribute('width', '100%'); svg.setAttribute('height', '100%');
+      svg.setAttribute('viewBox', `${g.box.x - pad} ${g.box.y - pad} ${g.box.w + pad * 2} ${g.box.h + pad * 2}`);
+      svg.setAttribute('preserveAspectRatio', 'none');
+      svg.style.cssText = 'position:absolute;inset:0;pointer-events:none;overflow:visible';
+      const stem = { x: g.from.x, y: g.from.y, w: g.tip.x - g.from.x, h: g.tip.y - g.from.y, strokeW: a.strokeW };
+      const hd = arrowHead(stem);
+      const path = document.createElementNS(NS, 'path');
+      path.setAttribute('d',
+        `M${g.from.x.toFixed(2)} ${g.from.y.toFixed(2)} L${g.tip.x.toFixed(2)} ${g.tip.y.toFixed(2)} ` +
+        `M${hd.l[0].toFixed(2)} ${hd.l[1].toFixed(2)} L${g.tip.x.toFixed(2)} ${g.tip.y.toFixed(2)} L${hd.r[0].toFixed(2)} ${hd.r[1].toFixed(2)}`);
+      path.setAttribute('stroke', a.color);
+      path.setAttribute('stroke-width', g.bw);
+      path.setAttribute('fill', 'none');
+      path.setAttribute('stroke-linecap', 'round');
+      path.setAttribute('stroke-linejoin', 'round');
+      svg.append(path);
+      const fam = fontCss(a.font);
+      const lab = h('div', { class: 'cl-label' });
+      lab.style.cssText =
+        `left:${(g.label.x - (g.box.x - pad)) * z}px;top:${(g.label.y - (g.box.y - pad)) * z}px;` +
+        `width:${g.inner * z}px;padding:${g.pad * z}px;border:${g.bw * z}px solid ${a.color};` +
+        `color:${a.color};font-family:${fam};font-size:${a.size * z}px;line-height:${g.lh * z}px`;
+      lab.textContent = a.text || '';
+      n.append(svg, lab);
+      /* a second grip, on the point itself, so a note can be re-aimed without
+         being redrawn */
+      if (S.sel === a.id) {
+        const tipGrip = h('span', { class: 'cl-tip', title: 'Drag to move the point', contenteditable: 'false' });
+        tipGrip.style.cssText = `left:${(g.tip.x - (g.box.x - pad)) * z}px;top:${(g.tip.y - (g.box.y - pad)) * z}px`;
+        tipGrip.addEventListener('pointerdown', e => {
+          e.stopPropagation(); e.preventDefault();
+          const ox = a.x, oy = a.y;
+          pushUndo();
+          dragLoop(e, (dx, dy) => { a.x = ox + dx / S.zoom; a.y = oy + dy / S.zoom; repaint(); });
+        });
+        n.append(tipGrip);
+      }
     } else if (a.type === 'img' && S.cropping === a.id) {
       n = h('div', Object.assign(base, { class: base.class + ' an-crop' }));
       n.style.cssText = `left:${a.x * z}px;top:${a.y * z}px;width:${a.w * z}px;height:${a.h * z}px;` +
@@ -1588,14 +1932,22 @@ function mountEditor() {
           a.cropSel = { x: Math.min(sx, cx), y: Math.min(sy, cy), w: Math.abs(cx - sx), h: Math.abs(cy - sy) };
           place(a.cropSel);
         };
+        /* pointercancel was not listened for, so a crop drag the system took
+           away — a scroll claiming the gesture on a tablet, or a release
+           outside the window — left the move handler on the window for good,
+           and the next drag anywhere redrew this crop box. */
         const up = () => {
           window.removeEventListener('pointermove', move);
           window.removeEventListener('pointerup', up);
+          window.removeEventListener('pointercancel', up);
+          window.removeEventListener('blur', up);
           if (a.cropSel && (a.cropSel.w < 0.02 || a.cropSel.h < 0.02)) a.cropSel = null;
           renderSidePanel(); repaint();
         };
         window.addEventListener('pointermove', move);
         window.addEventListener('pointerup', up);
+        window.addEventListener('pointercancel', up);
+        window.addEventListener('blur', up);
       });
     } else if (a.type === 'img') {
       n = h('div', Object.assign(base, { class: base.class + ' an-img' }));
@@ -1630,11 +1982,16 @@ function mountEditor() {
     const grabbable = S.mode === 'select' || S.cropping === a.id || (S.mode === 'picture' && a.type === 'img');
     if (!grabbable) n.style.pointerEvents = 'none';
     if (S.cropping !== a.id && !a.under) n.addEventListener('pointerdown', e => onAnnotDown(e, a, n));
-    if (a.type === 'text') {
-      n.addEventListener('dblclick', () => editText(a, n));
-    }
     if (S.sel === a.id && a.type !== 'ink') {
-      const hd = h('span', { class: 'handle' });
+      /* The handle is a CHILD of the object it resizes, and for a text box
+         that object becomes contenteditable. With the box still empty the
+         handle is its only child, so the caret lands INSIDE it and every
+         character typed goes into a 13px box pinned to the bottom-right
+         corner — which is why the text ran vertically down the edge while it
+         was being typed, then snapped onto one line the moment the box was
+         committed and textContent read the lot back. contenteditable="false"
+         keeps the caret out of it; editText takes it away altogether. */
+      const hd = h('span', { class: 'handle', contenteditable: 'false' });
       hd.addEventListener('pointerdown', e => onResize(e, a));
       n.append(hd);
     }
@@ -1695,8 +2052,38 @@ function mountEditor() {
            layer right after we focus the new box, which blurs it and ends the
            edit before a single key arrives. */
         e.preventDefault();
+        /* Clicking a box that is already there means "edit this one", not "put
+           a new one on top of it". In Add text mode the objects are
+           click-through, so the press lands on the layer and nothing else
+           would ever catch it — which is why text, once placed, could not be
+           changed without first finding the Select tool. */
+        const hit = S.annots.slice().reverse().find(x =>
+          x.type === 'text' && x.page === pg.n &&
+          p.x >= x.x - 2 && p.x <= x.x + (x.w || 0) + 2 &&
+          p.y >= x.y - 2 && p.y <= x.y + textHeight(x) + 2);
+        if (hit) {
+          select(hit.id);
+          repaint();
+          renderSidePanel();
+          const node = layer.querySelector(`[data-id="${hit.id}"]`);
+          if (node) requestAnimationFrame(() => editText(hit, node));
+          return;
+        }
         pushUndo();
-        const a = { id: uid(), type: 'text', page: pg.n, x: p.x, y: p.y, w: Math.min(260, pg.w - p.x - 10), text: '', size: S.fontSize, color: S.color, font: S.fontName };
+        /* Room for a few words at the size in force. A flat 260pt was fine at
+           16pt and about one word per line at 72. And clicking near the right
+           edge used to give a box of NEGATIVE width, which put every word on a
+           line of its own — so if there is no room to the right, the box moves
+           left to find some. */
+        const room = Math.max(80, pg.w - 20);
+        const want = Math.min(Math.max(260, S.fontSize * 11), room);
+        const floor = Math.min(want, Math.max(70, S.fontSize * 2.4));
+        let tw = Math.min(want, pg.w - p.x - 10), tx = p.x;
+        if (tw < floor) {
+          tw = Math.min(want, Math.max(floor, room));
+          tx = Math.max(10, pg.w - 10 - tw);
+        }
+        const a = { id: uid(), type: 'text', page: pg.n, x: tx, y: p.y, w: tw, text: '', size: S.fontSize, color: S.color, font: S.fontName };
         S.annots.push(a); repaint(); select(a.id);
         const open = () => {
           const node = layer.querySelector(`[data-id="${a.id}"]`);
@@ -1712,20 +2099,62 @@ function mountEditor() {
         };
         S.annots.push(a);
         let node = null;
+        /* The drag may go in any direction. Clamping the width to a positive
+           number instead of normalising it meant dragging right-to-left, or
+           upwards, left a 2pt dot where the box should have been. */
         dragLoop(e, (dx, dy) => {
-          a.w = Math.max(2, dx / S.zoom);
-          if (S.mode === 'hl') a.h = Math.max(S.fontSize * 0.9, dy / S.zoom || S.fontSize * 1.1);
-          else a.h = Math.max(2, dy / S.zoom);
+          const vw = dx / S.zoom, vh = dy / S.zoom;
+          a.x = Math.min(p.x, p.x + vw);
+          a.w = Math.max(2, Math.abs(vw));
+          if (S.mode === 'hl') {
+            const hh = Math.abs(vh) || S.fontSize * 1.1;
+            a.h = Math.max(S.fontSize * 0.9, hh);
+            a.y = vh < 0 ? p.y - a.h : p.y;
+          } else {
+            a.y = Math.min(p.y, p.y + vh);
+            a.h = Math.max(2, Math.abs(vh));
+          }
           node = swapNode(layer, a, node);
         }, () => { select(a.id); renderSidePanel(); });
-      } else if (S.mode === 'arrow') {
+      } else if (S.mode === 'callout') {
+        /* The drag starts on the thing being pointed at and ends where the
+           note should sit, which is how people describe it: "this bit, and
+           here is what I want to say about it". */
         pushUndo();
-        // w/h are the vector from tail to tip, so either may be negative
-        const a = { id: uid(), type: 'arrow', page: pg.n, x: p.x, y: p.y, w: 1, h: 0, color: S.color, strokeW: S.strokeW };
+        const a = {
+          id: uid(), type: 'callout', page: pg.n,
+          x: p.x, y: p.y, lx: p.x + 40, ly: p.y + 30,
+          w: Math.max(90, S.fontSize * 7), text: '', size: S.fontSize,
+          color: BRIGHT_PALETTE.includes(S.calloutColor) ? S.calloutColor : BRIGHT_PALETTE[0],
+          font: S.fontName, strokeW: Math.max(1.2, S.strokeW * 0.7)
+        };
         S.annots.push(a);
         let node = null;
         dragLoop(e, (dx, dy) => {
-          a.w = dx / S.zoom; a.h = dy / S.zoom;
+          a.lx = p.x + dx / S.zoom; a.ly = p.y + dy / S.zoom;
+          node = swapNode(layer, a, node);
+        }, () => {
+          // a tap rather than a drag still gets a note, just off to one side
+          if (Math.abs(a.lx - a.x) < 6 && Math.abs(a.ly - a.y) < 6) { a.lx = a.x + 40; a.ly = a.y + 26; }
+          select(a.id); repaint(); renderSidePanel();
+          const el = layer.querySelector(`[data-id="${a.id}"] .cl-label`);
+          if (el) requestAnimationFrame(() => editText(a, el, true));
+        });
+      } else if (S.mode === 'line' || S.mode === 'arrow') {
+        pushUndo();
+        // w/h are the vector from tail to tip, so either may be negative
+        const a = { id: uid(), type: S.mode, page: pg.n, x: p.x, y: p.y, w: 1, h: 0, color: S.color, strokeW: S.strokeW };
+        S.annots.push(a);
+        let node = null;
+        dragLoop(e, (dx, dy, ev) => {
+          let vx = dx / S.zoom, vy = dy / S.zoom;
+          if (ev && ev.shiftKey) {
+            // snap to the nearest 45 degrees, which is what Shift is for here
+            const len = Math.hypot(vx, vy);
+            const ang = Math.round(Math.atan2(vy, vx) / (Math.PI / 4)) * (Math.PI / 4);
+            vx = Math.cos(ang) * len; vy = Math.sin(ang) * len;
+          }
+          a.w = vx; a.h = vy;
           node = swapNode(layer, a, node);
         }, () => {
           if (Math.hypot(a.w, a.h) < 4) S.annots = S.annots.filter(x => x.id !== a.id);
@@ -1758,7 +2187,10 @@ function mountEditor() {
             const touched = await applyRubber(stroke);
             if (!touched) S.undoStack.pop();          // nothing was under it
             repaint(); renderSidePanel();
-          }
+          },
+          /* The system took the gesture — throw the half-drawn rubber away
+             rather than erasing whatever it happened to have crossed. */
+          cancel: () => { if (S.cancelStroke) S.cancelStroke(); }
         });
       } else if (S.mode === 'ink') {
         pushUndo();
@@ -1788,11 +2220,12 @@ function mountEditor() {
             live.done();
             if (a.pts.length < 2) S.annots = S.annots.filter(x => x.id !== a.id);
             repaint();
-          }
+          },
+          cancel: () => { if (S.cancelStroke) S.cancelStroke(); }
         });
       } else if (S.mode === 'img' && S.pendingImage) {
         placePending(pg, p);
-      } else if (S.mode === 'sign' && S.pendingSig) {
+      } else if ((S.mode === 'sign' || S.mode === 'seal') && S.pendingSig) {
         placePending(pg, p);
       }
     });
@@ -1802,7 +2235,7 @@ function mountEditor() {
     const src = S.pendingImage || S.pendingSig;
     if (!src) return;
     pushUndo();
-    const maxW = Math.min(src.w, pg.w * 0.5);
+    const maxW = Math.min(src.w, pg.w * (src.maxFrac || 0.5));
     const scale = maxW / src.w;
     const a = { id: uid(), type: 'img', page: pg.n, x: p.x, y: p.y, w: src.w * scale, h: src.h * scale, url: src.url, bytes: src.bytes, fmt: src.fmt };
     S.annots.push(a); repaint(); select(a.id);
@@ -1822,12 +2255,16 @@ function mountEditor() {
     const host = $('#wb-stage') || null;
     if (host) {
       captureGesture(host, e, {
-        move: ev => { const last = allSamples(ev).pop(); onMove(last.clientX - sx, last.clientY - sy); },
-        end: () => { if (onEnd) onEnd(); }
+        move: ev => { const last = allSamples(ev).pop(); onMove(last.clientX - sx, last.clientY - sy, last); },
+        end: () => { if (onEnd) onEnd(); },
+        /* A drag has already moved the object as it went, so a cancelled one
+           settles where it is — but it must still settle, or the object stays
+           selected-but-mid-drag and the next repaint drops it back. */
+        cancel: () => { if (onEnd) onEnd(); }
       });
       return;
     }
-    const move = ev => onMove(ev.clientX - sx, ev.clientY - sy);
+    const move = ev => onMove(ev.clientX - sx, ev.clientY - sy, ev);
     const stop = () => {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', stop);
@@ -1873,12 +2310,35 @@ function mountEditor() {
     return { update, done: () => svg.remove() };
   }
 
+  /* The second press of a double-click on a text box, so it can be re-opened.
+
+     A `dblclick` listener cannot work here, and nor can a `click` one: pressing
+     an object selects it, selecting repaints the layer, and the element under
+     the pointer is therefore replaced between mousedown and mouseup — so the
+     browser never produces a click event at all, let alone a double one. That
+     left no way back into a text box to fix a typo. Timing the presses does
+     work, because each press lands on whatever element is current. */
+  let lastTextPress = null;
+
   function onAnnotDown(e, a, node) {
     e.stopPropagation();
     if (node.getAttribute('contenteditable') === 'true') return;
+    if ((a.type === 'text' || a.type === 'callout') && S.mode === 'select') {
+      const now = Date.now();
+      if (lastTextPress && lastTextPress.id === a.id && now - lastTextPress.t < 450) {
+        lastTextPress = null;
+        e.preventDefault();
+        // a comment's words live in its label, not in the object's own box
+        const target = a.type === 'callout' ? node.querySelector('.cl-label') : node;
+        if (target) editText(a, target);
+        return;
+      }
+      lastTextPress = { id: a.id, t: now };
+    }
     select(a.id);
     renderSidePanel();
     const ox = a.x, oy = a.y, opts = a.pts ? a.pts.map(p => p.slice()) : null;
+    const olx = a.lx, oly = a.ly;          // a comment carries its note with it
     let moved = false;
     pushUndo();
     /* Keep a grabbable piece of the object on the page. Dragged far enough, its
@@ -1895,7 +2355,16 @@ function mountEditor() {
         const bw = Math.max(...xs) - bx, bh = Math.max(...ys) - by;
         mx = clamp(bx + mx, -bw + EDGE, pg.w - EDGE) - bx;
         my = clamp(by + my, -bh + EDGE, pg.h - EDGE) - by;
-        a.pts = opts.map(q => [q[0] + mx, q[1] + my]);
+        /* carry the third element through: it is the width the pencil's
+           pressure gave that sample, and dropping it flattened a
+           pressure-varying stroke to a uniform line as soon as it was moved */
+        a.pts = opts.map(q => q.length > 2 ? [q[0] + mx, q[1] + my, q[2]] : [q[0] + mx, q[1] + my]);
+      } else if (a.type === 'callout') {
+        const b = shapeBox(a);
+        mx = clamp(b.x + mx, -b.w + EDGE, pg.w - EDGE) - b.x;
+        my = clamp(b.y + my, -b.h + EDGE, pg.h - EDGE) - b.y;
+        a.x = ox + mx; a.y = oy + my;
+        a.lx = olx + mx; a.ly = oly + my;
       } else {
         a.x = clamp(ox + mx, -(a.w || 0) + EDGE, pg.w - EDGE);
         a.y = clamp(oy + my, -(a.h || 0) + EDGE, pg.h - EDGE);
@@ -1909,18 +2378,42 @@ function mountEditor() {
     const ow = a.w, oh = a.h, os = a.size;
     pushUndo();
     dragLoop(e, (dx, dy) => {
-      if (a.type === 'arrow') {            // the handle is the tip: any direction
+      if (a.type === 'callout') {          // the handle sets how wide the note is
+        a.w = Math.max(a.size * 3, ow + dx / S.zoom);
+        repaint(); return;
+      }
+      if (a.type === 'arrow' || a.type === 'line') {   // the handle is the tip: any direction
         a.w = ow + dx / S.zoom; a.h = oh + dy / S.zoom;
         repaint(); return;
       }
+      if (a.type === 'text') {
+        /* The handle SCALES a text box: the type size moves with the width.
+           So clamp the scale, not the width. Clamping the width alone let the
+           box shrink to 8pt while the size stopped at its 6pt floor — and a
+           14px-wide box full of 6pt text puts one letter on each line, which
+           is what "the text keeps going vertical" was. */
+        const k = clamp((ow + dx / S.zoom) / Math.max(1, ow), 6 / os, 400 / os);
+        a.size = Math.max(6, Math.round(os * k));
+        a.w = Math.max(minTextWidth(a), ow * k);
+        repaint();
+        return;
+      }
       a.w = Math.max(8, ow + dx / S.zoom);
-      if (a.type === 'text') a.size = Math.max(6, Math.round(os * (a.w / Math.max(1, ow))));
-      else a.h = Math.max(4, oh + dy / S.zoom);
+      a.h = Math.max(4, oh + dy / S.zoom);
       repaint();
     });
   }
 
   function editText(a, node, selectAll) {
+    if (node.getAttribute('contenteditable')) return;      // already open
+    /* Nothing but the text itself may be inside the box while it is being
+       typed into. The resize handle lives in here, and an empty box has
+       nothing else for the caret to go into. */
+    node.querySelectorAll('.handle, .movebar, .wrapgrip').forEach(n => n.remove());
+    /* Whichever tool is up, an open box must take the pointer: outside Select
+       the objects are click-through, and a caret cannot be placed in something
+       the pointer passes straight through. */
+    node.style.pointerEvents = 'auto';
     node.setAttribute('contenteditable', 'plaintext-only');
     if (node.getAttribute('contenteditable') !== 'plaintext-only') node.setAttribute('contenteditable', 'true');
     node.style.userSelect = 'text';
@@ -1936,9 +2429,13 @@ function mountEditor() {
       node.removeEventListener('blur', finish);
       node.removeAttribute('contenteditable');
       node.classList.remove('editing');
-      const v = node.textContent.replace(/\u00a0/g, ' ');
+      /* read the typed text only — never a stray control that found its way in */
+      const copy = node.cloneNode(true);
+      copy.querySelectorAll('.handle, .movebar, .wrapgrip').forEach(n => n.remove());
+      const v = copy.textContent.replace(/\u00a0/g, ' ');
       if (v !== a.text) a.text = v;
       if (!a.text.trim()) S.annots = S.annots.filter(x => x.id !== a.id);
+      else if (a.type === 'callout') select(a.id);
       /* The node is torn down from inside its own blur handler, so hand the
          rebuild to the next task rather than removing the node mid-dispatch. */
       setTimeout(() => { repaint(); renderSidePanel(); }, 0);
@@ -1991,22 +2488,78 @@ function mountEditor() {
     if (id === null) renderSidePanel();
   }
 
+  /* A snapshot used to be JSON. That quietly destroyed every picture on the
+     page: an image's bytes are a Uint8Array, and JSON turns one into
+     {"0":137,"1":80,…} with no length, so the next save threw inside the PNG
+     writer and the whole export failed. It was also the reason forty snapshots
+     weighed tens of megabytes — six bytes of JSON per byte of image.
+
+     Clone by hand instead. Everything the editor mutates is copied; the byte
+     arrays are never written to once created, so a snapshot can share them. */
+  function cloneAnnot(a) {
+    const c = {};
+    for (const k in a) {
+      const v = a[k];
+      if (v instanceof Uint8Array) c[k] = v;                 // immutable — share it
+      else if (Array.isArray(v)) c[k] = v.map(p => Array.isArray(p) ? p.slice() : p);
+      else if (v && typeof v === 'object') c[k] = Object.assign({}, v);
+      else c[k] = v;
+    }
+    return c;
+  }
+
+  /* The document's own text runs carry edit state of their own — what the line
+     now says, where it was dragged to, which patch objects belong to it. Undo
+     has to put those back as well, or the paragraph keeps the new text on
+     screen while the objects that drew it are gone. */
+  const RUNKEYS = ['str', 'rows', 'h', 'w', 'dx', 'dy', 'edited', 'annotIds', 'fit'];
+  function snapRuns() {
+    const out = [];
+    for (const rec of S.pageEls) {
+      if (!rec.runs) continue;
+      out.push({
+        rec, state: rec.runs.map(r => {
+          const o = {};
+          for (const k of RUNKEYS) o[k] = Array.isArray(r[k]) ? r[k].slice() : r[k];
+          return o;
+        })
+      });
+    }
+    return out;
+  }
+  function applyRuns(snap) {
+    if (!snap) return;
+    for (const { rec, state } of snap) {
+      if (!rec.runs || rec.runs.length !== state.length) continue;
+      rec.runs.forEach((r, i) => {
+        const o = state[i];
+        for (const k of RUNKEYS) r[k] = Array.isArray(o[k]) ? o[k].slice() : o[k];
+      });
+      if (rec.tlayer && !rec.tlayer.hidden) paintTextLayer(rec);
+    }
+  }
+
+  const snapshot = () => ({ annots: S.annots.map(cloneAnnot), runs: snapRuns() });
+
   function pushUndo() {
-    S.undoStack.push(JSON.stringify(S.annots));
+    S.undoStack.push(snapshot());
     if (S.undoStack.length > 40) S.undoStack.shift();
     S.redoStack.length = 0;
   }
+  function restore(snap) {
+    S.annots = snap.annots;
+    applyRuns(snap.runs);
+    S.sel = null; repaint(); renderSidePanel();
+  }
   function undo() {
     if (!S.undoStack.length) return;
-    S.redoStack.push(JSON.stringify(S.annots));
-    S.annots = JSON.parse(S.undoStack.pop());
-    S.sel = null; repaint(); renderSidePanel();
+    S.redoStack.push(snapshot());
+    restore(S.undoStack.pop());
   }
   function redo() {
     if (!S.redoStack.length) return;
-    S.undoStack.push(JSON.stringify(S.annots));
-    S.annots = JSON.parse(S.redoStack.pop());
-    S.sel = null; repaint(); renderSidePanel();
+    S.undoStack.push(snapshot());
+    restore(S.redoStack.pop());
   }
 
   async function insertImage() {
@@ -2032,6 +2585,52 @@ function mountEditor() {
       toast('Click a page to place the image');
     } catch (e) { toast('That image could not be read.', true); }
     renderSidePanel();
+  }
+
+  /* Put a saved signature or stamp on the page. Same two-step as Add image:
+     with a mouse you choose where it lands, with a finger it is dropped onto
+     the page you are looking at, because asking for a second tap is where
+     people lose it. */
+  async function placeSaved(a) {
+    try {
+      const bytes = inkBytes(a);
+      if (S.pendingSig && S.pendingSig.url && S.pendingSig.url.startsWith('blob:')) {
+        try { URL.revokeObjectURL(S.pendingSig.url); } catch (e) {}
+      }
+      /* the photograph is captured at roughly twice the size it wants to be
+         printed, so halve it into points and let the page cap it */
+      S.pendingSig = {
+        url: a.data, bytes, fmt: 'png',
+        w: a.width / 2, h: a.height / 2,
+        maxFrac: a.kind === 'stamp' ? 0.25 : 0.42
+      };
+      if (coarsePointer()) {
+        const rec = visiblePage();
+        if (rec) {
+          placePending(rec.pg, { x: Math.max(12, rec.pg.w / 2 - 60), y: Math.max(12, visibleTop(rec) + 40) });
+          toast(a.name + ' placed \u2014 drag it where you want it');
+          return;
+        }
+      }
+      S.mode = 'seal';
+      syncRail();
+      renderSidePanel();
+      toast('Click the page to place ' + a.name + '.');
+    } catch (e) {
+      console.error(e);
+      toast('That saved ink could not be read.', true);
+    }
+  }
+
+  function removeInk(a) {
+    confirmSheet('Delete this ink?',
+      '\u201c' + a.name + '\u201d will be removed from this browser. Copies already placed on the document stay where they are.',
+      'Delete', async () => {
+        try { await inkStore('delete', a.id); } catch (e) { /* a session-only item has nothing stored to remove */ }
+        S.ink = (S.ink || []).filter(x => x.id !== a.id);
+        renderSidePanel();
+        toast('\u201c' + a.name + '\u201d deleted.');
+      });
   }
 
   /* the page the reader is actually looking at */
@@ -2088,8 +2687,10 @@ function mountEditor() {
             class: 'btn primary', onclick: async () => {
               if (!any) { toast('Draw a signature first.', true); return; }
               const trimmed = trimCanvas(cv);
-              const blob = await new Promise(r => trimmed.toBlob(r, 'image/png'));
+              const blob = await toBlobOrThrow(trimmed, 'image/png');
               const bytes = new Uint8Array(await blob.arrayBuffer());
+              // a signature drawn and then redrawn left the first one's URL behind
+              if (S.pendingSig && S.pendingSig.url) { try { URL.revokeObjectURL(S.pendingSig.url); } catch (e2) {} }
               S.pendingSig = { url: URL.createObjectURL(blob), bytes, fmt: 'png', w: trimmed.width / 2, h: trimmed.height / 2 };
               close();
               toast('Click on a page to place your signature');
@@ -2098,12 +2699,24 @@ function mountEditor() {
         )
       );
       requestAnimationFrame(resize);
+    }, () => {
+      // dismissed however: leave the rail in a state that matches reality
+      if (S.mode === 'sign' && !S.pendingSig) { S.mode = 'select'; syncRail(); renderSidePanel(); }
     });
   }
 
+  /* The Stamp & sign sheet offers "Draw" alongside the two photo buttons, but
+     it is built outside this mount and the pad lives in here. Hand it over for
+     as long as the editor is up. */
+  S.drawSignature = signatureDialog;
+  onCleanup(() => { if (S.drawSignature === signatureDialog) S.drawSignature = null; });
+
   /* ---- write the edited document ---- */
+  let exporting = false;
   async function exportEdited() {
+    if (exporting) { toast('Still writing the PDF.', true); return; }
     if (!S.annots.length) { toast('Nothing has been added yet.', true); return; }
+    exporting = true;
     progress(0.05);
     try {
       const out = await PDFDocument.load(S.doc.bytes.slice(0), { ignoreEncryption: true, updateMetadata: false });
@@ -2115,16 +2728,27 @@ function mountEditor() {
       for (const a of S.annots) {
         const page = pages[a.page - 1];
         if (!page) continue;
-        const { width: W, height: H } = page.getSize();
+        /* Every coordinate on screen came from a pdf.js viewport, and pdf.js
+           lays a page out on its CROP box. pdf-lib's getSize reports the MEDIA
+           box, and the two are not the same file to file: a press-ready PDF
+           typically crops a bleed off a larger sheet. Building the transform
+           from the media box put every annotation out by the difference —
+           several millimetres on a trimmed page, and the whole bleed on a
+           badly trimmed one. Take the crop box, origin included. */
+        const crop = pageCrop(page);
+        const W = crop.width, H = crop.height;
         const R = ((page.getRotation().angle % 360) + 360) % 360;
         const map = (dx, dy, dw = 0, dh = 0) => {
-          if (R === 90) return { x: dy + dh, y: dx };
-          if (R === 180) return { x: W - dx, y: dy + dh };
-          if (R === 270) return { x: W - dy - dh, y: H - dx };
-          return { x: dx, y: H - dy - dh };
+          let p;
+          if (R === 90) p = { x: dy + dh, y: dx };
+          else if (R === 180) p = { x: W - dx, y: dy + dh };
+          else if (R === 270) p = { x: W - dy - dh, y: H - dx };
+          else p = { x: dx, y: H - dy - dh };
+          return { x: p.x + crop.x, y: p.y + crop.y };
         };
 
         if (a.type === 'text') {
+          fixTextBox(a, W);              // what is written must match what was shown
           let font = await getFont(a.font);
           let body = a.text;
           if (!canWrite(font, body)) {
@@ -2177,6 +2801,40 @@ function mountEditor() {
           line(a.x, a.y, a.x + a.w, a.y + a.h);
           line(hd.l[0], hd.l[1], a.x + a.w, a.y + a.h);
           line(hd.r[0], hd.r[1], a.x + a.w, a.y + a.h);
+        } else if (a.type === 'line') {
+          page.drawLine({
+            start: map(a.x, a.y), end: map(a.x + a.w, a.y + a.h),
+            thickness: a.strokeW, color: hex2rgb(a.color), lineCap: 1
+          });
+        } else if (a.type === 'callout') {
+          const g = calloutGeom(a);
+          const stem = { x: g.from.x, y: g.from.y, w: g.tip.x - g.from.x, h: g.tip.y - g.from.y, strokeW: a.strokeW };
+          const hd = arrowHead(stem);
+          const line = (ax, ay, bx, by) => page.drawLine({
+            start: map(ax, ay), end: map(bx, by),
+            thickness: g.bw, color: hex2rgb(a.color), lineCap: 1
+          });
+          // the note first, so the arrow meets its edge rather than sitting under it
+          const lp = map(g.label.x, g.label.y, g.label.w, g.label.h);
+          page.drawRectangle({
+            x: lp.x, y: lp.y, width: g.label.w, height: g.label.h, rotate: degrees(R),
+            color: rgb(1, 1, 1), borderColor: hex2rgb(a.color), borderWidth: g.bw
+          });
+          line(g.from.x, g.from.y, g.tip.x, g.tip.y);
+          line(hd.l[0], hd.l[1], g.tip.x, g.tip.y);
+          line(hd.r[0], hd.r[1], g.tip.x, g.tip.y);
+          let cfont = await getFont(withFmtNone(a.font));
+          let body = a.text;
+          if (!canWrite(cfont, body)) {
+            const safe = toWinAnsi(body);
+            if (safe.changed) folded = true;
+            body = safe.text;
+          }
+          const inner = g.label.x + g.pad + g.bw;
+          wrapText(body, cfont, a.size, g.inner).forEach((ln, i) => {
+            const q = map(inner, g.label.y + g.pad + g.bw + a.size * 0.84 + i * g.lh);
+            page.drawText(ln, { x: q.x, y: q.y, size: a.size, font: cfont, color: hex2rgb(a.color), rotate: degrees(R) });
+          });
         } else if (a.type === 'erase') {
           continue;                     // a rubbing is not something to draw
         } else if (a.type === 'cover') {
@@ -2210,7 +2868,7 @@ function mountEditor() {
     } catch (e) {
       console.error(e);
       toast('Could not write the PDF: ' + (e.message || 'unknown error'), true);
-    } finally { setTimeout(() => progress(null), 400); }
+    } finally { exporting = false; setTimeout(() => progress(null), 400); }
   }
 }
 
@@ -2244,12 +2902,18 @@ function guessStdFont(name) {
    font's own metrics, so measure it once per face instead of assuming. Without
    this the preview sits ~0.2em below where the PDF will actually draw. */
 const BASELINE = new Map();
-function baselineEm(family, weight, style) {
-  const key = family + '|' + weight + '|' + style;
+/* `lead` is the line-height the element will actually use, as a multiple of the
+   font size. It has to be measured with that leading: the probe used to assume
+   1.22 while the editor sets the document's own, so on a tightly or loosely led
+   paragraph the preview sat a fraction of a line off where the PDF would draw
+   it, and the text shifted the moment it was committed. */
+function baselineEm(family, weight, style, lead) {
+  const lh = (typeof lead === 'number' && isFinite(lead) && lead > 0) ? +lead.toFixed(3) : 1.22;
+  const key = family + '|' + weight + '|' + style + '|' + lh;
   if (BASELINE.has(key)) return BASELINE.get(key);
   let v = 1.015;
   try {
-    const probe = h('span', { style: `position:absolute;left:-9999px;top:0;visibility:hidden;font-family:${family};font-weight:${weight};font-style:${style};font-size:100px;line-height:1.22` }, 'Hxy');
+    const probe = h('span', { style: `position:absolute;left:-9999px;top:0;visibility:hidden;font-family:${family};font-weight:${weight};font-style:${style};font-size:100px;line-height:${lh}` }, 'Hxy');
     const mark = h('span', { style: 'display:inline-block;width:0;height:0;vertical-align:baseline' });
     probe.append(mark);
     document.body.append(probe);
@@ -2269,6 +2933,41 @@ function fontCss(f) {
   if (/Times/.test(f)) return '"Times New Roman", Times, "Liberation Serif", "Nimbus Roman", Tinos, "TeX Gyre Termes", serif';
   if (/Courier/.test(f)) return '"Courier New", Courier, "Liberation Mono", "Nimbus Mono PS", Cousine, "TeX Gyre Cursor", monospace';
   return 'Helvetica, Arial, "Liberation Sans", "Nimbus Sans", Arimo, "TeX Gyre Heros", sans-serif';
+}
+
+/* A comment's label is written in the face it was created with; the side
+   panel's type overrides belong to the document-text editor, not to this. */
+function withFmtNone(f) { return StandardFonts[f] ? f : 'Helvetica'; }
+
+/* The box pdf.js actually laid the page out on, as {x, y, width, height} in
+   PDF user space. Falls back to the media box on a file that declares no crop
+   box, and to getSize if this build of pdf-lib has neither. */
+function pageCrop(page) {
+  for (const get of ['getCropBox', 'getMediaBox']) {
+    try {
+      const b = typeof page[get] === 'function' ? page[get]() : null;
+      if (b && b.width > 0 && b.height > 0) {
+        return { x: b.x || 0, y: b.y || 0, width: b.width, height: b.height };
+      }
+    } catch (e) {}
+  }
+  const s = page.getSize();
+  return { x: 0, y: 0, width: s.width, height: s.height };
+}
+
+/* canvas.toBlob hands back null rather than throwing when the browser will not
+   encode the canvas — most often because it is larger than the platform allows
+   (iOS has a hard cap). Every caller here went on to use that null as a blob,
+   which failed somewhere further along with a message about the wrong thing. */
+function toBlobOrThrow(canvas, type, quality) {
+  return new Promise((res, rej) => {
+    try {
+      canvas.toBlob(b => b ? res(b)
+        : rej(new Error('this browser could not encode an image that large (' +
+            canvas.width + '\u00d7' + canvas.height + ' pixels)')),
+        type, quality);
+    } catch (e) { rej(e); }
+  });
 }
 
 const toHex = c => '#' + c.map(v => clamp(Math.round(v), 0, 255).toString(16).padStart(2, '0')).join('');
@@ -2445,20 +3144,28 @@ async function bakeImage(a) {
     c.filter = `brightness(${f.b}%) contrast(${f.c}%) saturate(${f.s}%) grayscale(${f.g}%)`;
     c.drawImage(img, 0, 0);
     const png = a.fmt === 'png';
-    const blob = await new Promise(r => cv.toBlob(r, png ? 'image/png' : 'image/jpeg', 0.92));
+    const blob = await toBlobOrThrow(cv, png ? 'image/png' : 'image/jpeg', 0.92);
     return { bytes: new Uint8Array(await blob.arrayBuffer()), fmt: png ? 'png' : 'jpg' };
   } catch (e) { return { bytes, fmt: a.fmt }; }
 }
 
+/* Break text to a width without rewriting it. Splitting on /\s+/ and rejoining
+   with a single space turned every run of spaces into one — a line the user had
+   indented, or columns they had lined up by eye, came back closed up. Keeping
+   the separators means what goes in is what comes out, bar the breaks. */
 function wrapText(text, font, size, maxW) {
   const out = [];
+  const width = probe => {
+    try { return font.widthOfTextAtSize(probe, size); } catch (e) { return probe.length * size * 0.5; }
+  };
   for (const para of String(text).split('\n')) {
     let line = '';
-    for (const word of para.split(/\s+/)) {
-      const probe = line ? line + ' ' + word : word;
-      let w = 0;
-      try { w = font.widthOfTextAtSize(probe, size); } catch (e) { w = probe.length * size * 0.5; }
-      if (w > maxW && line) { out.push(line); line = word; } else line = probe;
+    for (const piece of para.split(/(\s+)/)) {
+      if (!piece) continue;
+      // a run of spaces never forces a break; it rides on the end of the line
+      if (/^\s+$/.test(piece)) { line += piece; continue; }
+      if (line && width(line + piece) > maxW) { out.push(line); line = piece; }
+      else line += piece;
     }
     out.push(line);
   }
@@ -2478,14 +3185,27 @@ async function loadImageFile(file) {
   const im = await new Promise((res, rej) => {
     const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url;
   });
-  // WebP (and anything not PNG/JPEG) is re-encoded so pdf-lib can embed it.
-  if (!isPng && !/jpe?g$/i.test(file.name) && file.type !== 'image/jpeg') {
-    const cv = h('canvas'); cv.width = im.naturalWidth; cv.height = im.naturalHeight;
-    cv.getContext('2d').drawImage(im, 0, 0);
-    const jb = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.92));
-    return { url: URL.createObjectURL(jb), bytes: new Uint8Array(await jb.arrayBuffer()), fmt: 'jpg', w: im.naturalWidth, h: im.naturalHeight };
-  }
-  return { url, bytes, fmt: isPng ? 'png' : 'jpg', w: im.naturalWidth, h: im.naturalHeight };
+  const isJpg = /jpe?g$/i.test(file.name) || file.type === 'image/jpeg';
+
+  /* JPEG goes in untouched — the writer only reads its header. Everything else
+     is redrawn through a canvas first. That covers WebP, which the writer
+     cannot read at all, and PNG, where its decoder can spin for ever on a
+     perfectly ordinary file: a plain 8-bit RGBA PNG of 118 bytes locks it up
+     solid, in Node as well as in a browser, with no error to catch. A PNG the
+     canvas has re-encoded is one it handles. */
+  if (isJpg) return { url, bytes, fmt: 'jpg', w: im.naturalWidth, h: im.naturalHeight };
+
+  const cv = h('canvas');
+  cv.width = im.naturalWidth; cv.height = im.naturalHeight;
+  cv.getContext('2d').drawImage(im, 0, 0);
+  const keepAlpha = isPng || /\.(gif|webp)$/i.test(file.name) || /image\/(png|gif|webp)/.test(file.type || '');
+  const out = await toBlobOrThrow(cv, keepAlpha ? 'image/png' : 'image/jpeg', 0.92);
+  return {
+    url: URL.createObjectURL(out),
+    bytes: new Uint8Array(await out.arrayBuffer()),
+    fmt: keepAlpha ? 'png' : 'jpg',
+    w: im.naturalWidth, h: im.naturalHeight
+  };
 }
 
 function trimCanvas(cv) {
@@ -2512,6 +3232,10 @@ function mountOrganize() {
   });
 
   let items = S.doc.pages.map(p => ({ key: uid(), src: p.n - 1, rot: 0, on: false, w: p.w, h: p.h }));
+  /* One export at a time. Clicking Save twice used to start a second write over
+     the first, and whichever finished last offered its file under the other
+     one's name. */
+  let busy = false;
   const stage = $('#wb-stage');
   const side = $('#wb-side'); side.dataset.wanted = '1'; applySidePanel();
   const acts = $('#wb-actions');
@@ -2603,14 +3327,21 @@ function mountOrganize() {
   }
 
   async function exportPages(list, isExtract) {
+    if (busy) { toast('Still writing the last one.', true); return; }
+    busy = true;
+    /* Take the order and the rotations now. Reading them back after the awaits
+       meant a page rotated or deleted while the file was being written went
+       into it — or, worse, the index no longer matched and a different page
+       came out turned on its side. */
+    const plan = list.map(i => ({ src: i.src, rot: i.rot }));
     progress(0.1);
     try {
       const src = await PDFDocument.load(S.doc.bytes.slice(0), { ignoreEncryption: true });
       const out = await PDFDocument.create();
-      const copied = await out.copyPages(src, list.map(i => i.src));
+      const copied = await out.copyPages(src, plan.map(i => i.src));
       copied.forEach((pg, i) => {
         const base = ((pg.getRotation().angle % 360) + 360) % 360;
-        pg.setRotation(degrees((base + list[i].rot + 360) % 360));
+        pg.setRotation(degrees((base + plan[i].rot + 360) % 360));
         out.addPage(pg);
       });
       const bytes = await out.save();
@@ -2619,7 +3350,7 @@ function mountOrganize() {
       offerContinue(bytes, outName(S.doc.name, isExtract ? '-extract' : '-organized'));
     } catch (e) {
       toast('Could not write the PDF: ' + (e.message || 'unknown error'), true);
-    } finally { setTimeout(() => progress(null), 400); }
+    } finally { busy = false; setTimeout(() => progress(null), 400); }
   }
 
   draw();
@@ -2629,15 +3360,28 @@ function mountOrganize() {
 function offerContinue(bytes, name) {
   toast('Tip: use “Keep working on it” to chain another tool');
   const acts = $('#wb-actions');
-  if (acts.querySelector('[data-cont]')) return;
-  acts.prepend(h('button', {
+  /* The button used to be added once and then skipped, so after a second
+     export it still carried the FIRST file's bytes — a whole document held for
+     the life of the tab, and the wrong one offered if it was ever clicked.
+     Replace it, and let go of the bytes the moment they are used or the tool is
+     left. */
+  const old = acts.querySelector('[data-cont]');
+  if (old) old.remove();
+  let held = bytes;
+  const btn = h('button', {
     class: 'btn sm', 'data-cont': '1', onclick: async () => {
-      await setDoc(new Uint8Array(bytes), name);
+      const b = held;
+      held = null;
+      btn.remove();
+      if (!b) return;
+      await setDoc(new Uint8Array(b), name);
       updateMeta();
       mount(S.tool);
       toast('Now working on ' + name);
     }
-  }, 'Keep working on it'));
+  }, 'Keep working on it');
+  acts.prepend(btn);
+  onCleanup(() => { held = null; });
 }
 
 /* ================================================================== MERGE */
@@ -2646,8 +3390,12 @@ function mountMerge() {
   const side = $('#wb-side'); side.dataset.wanted = '1'; applySidePanel();
   const acts = $('#wb-actions');
   let files = [];
+  let busy = false;
 
   if (S.doc) files.push({ key: uid(), name: S.doc.name, bytes: S.doc.bytes, kind: 'pdf', size: S.doc.bytes.length });
+  /* Images picked here hold blob URLs; they belong to this mount and nothing
+     else, so they go when the tool does. */
+  onCleanup(() => { for (const f of files) if (f.img && f.img.url) { try { URL.revokeObjectURL(f.img.url); } catch (e) {} } });
 
   acts.append(
     h('button', { class: 'btn', onclick: add }, ico('plus'), 'Add files'),
@@ -2706,53 +3454,82 @@ function mountMerge() {
   }
 
   async function run() {
+    if (busy) { toast('Still merging.', true); return; }
     if (files.length < 2) { toast('Add at least two files to merge.', true); return; }
+    busy = true;
+    const plan = files.slice();          // the order as it is now, not as it ends up
     progress(0.05);
     try {
       const out = await PDFDocument.create();
-      for (let i = 0; i < files.length; i++) {
-        const f = files[i];
-        if (f.kind === 'pdf') {
-          const src = await PDFDocument.load(f.bytes.slice(0), { ignoreEncryption: true });
-          const pages = await out.copyPages(src, src.getPageIndices());
-          pages.forEach(p => out.addPage(p));
-        } else {
-          const emb = f.img.fmt === 'png' ? await out.embedPng(f.img.bytes) : await out.embedJpg(f.img.bytes);
-          const pg = out.addPage([emb.width, emb.height]);
-          pg.drawImage(emb, { x: 0, y: 0, width: emb.width, height: emb.height });
+      /* One bad file in a batch of twenty used to throw and lose the other
+         nineteen. Skip what cannot be read, say which, and merge the rest —
+         and name an encrypted file as encrypted rather than letting
+         ignoreEncryption hand back a document whose pages will not copy. */
+      const skipped = [];
+      for (let i = 0; i < plan.length; i++) {
+        const f = plan[i];
+        try {
+          if (f.kind === 'pdf') {
+            const src = await PDFDocument.load(f.bytes.slice(0), { ignoreEncryption: true });
+            if (src.isEncrypted) { skipped.push(f.name + ' (password-protected)'); continue; }
+            const pages = await out.copyPages(src, src.getPageIndices());
+            pages.forEach(p => out.addPage(p));
+          } else {
+            const emb = f.img.fmt === 'png' ? await out.embedPng(f.img.bytes) : await out.embedJpg(f.img.bytes);
+            const pg = out.addPage([emb.width, emb.height]);
+            pg.drawImage(emb, { x: 0, y: 0, width: emb.width, height: emb.height });
+          }
+        } catch (e) {
+          console.error('merge: skipped ' + f.name, e);
+          skipped.push(f.name);
         }
-        progress(0.05 + 0.9 * ((i + 1) / files.length));
+        progress(0.05 + 0.9 * ((i + 1) / plan.length));
       }
+      if (!out.getPageCount()) throw new Error('none of those files could be read');
       const bytes = await out.save();
       progress(1);
+      if (skipped.length) {
+        toast('Skipped ' + skipped.slice(0, 3).join(', ') +
+          (skipped.length > 3 ? ` and ${skipped.length - 3} more` : '') + '.', true);
+      }
       await offerFile('merged.pdf', bytes);
       offerContinue(bytes, 'merged.pdf');
     } catch (e) {
       toast('Merge failed: ' + (e.message || 'unknown error'), true);
-    } finally { setTimeout(() => progress(null), 400); }
+    } finally { busy = false; setTimeout(() => progress(null), 400); }
   }
 
   draw();
 }
 
+/* How many separate files one batch may produce. The pieces are all held until
+   the zip is written, so this is a memory bound, not a taste one. */
+const MAX_PARTS = 150;
+
 /* ================================================================== SPLIT */
+/* Returns {ranges, bad} — the ranges that make sense, and the pieces of the
+   spec that do not. Clamping silently was the wrong answer: typing 5-90 on a
+   nine-page document produced "pages 5-9" with no hint that the 90 had been
+   quietly adjusted, and a typo like "1-3, 7x" simply dropped the 7x. */
 function parseRanges(spec, total) {
   const out = [];
+  const bad = [];
   for (const chunk of String(spec).split(',')) {
     const t = chunk.trim();
     if (!t) continue;
     let m;
-    if ((m = t.match(/^(\d+)\s*-\s*(\d+)$/))) {
-      const a = clamp(+m[1], 1, total), b = clamp(+m[2], 1, total);
+    const ok = (a, b) => {
+      if (a < 1 || b < 1 || a > total || b > total) { bad.push(t); return; }
       out.push({ from: Math.min(a, b), to: Math.max(a, b) });
-    } else if ((m = t.match(/^(\d+)\s*-$/))) {
-      out.push({ from: clamp(+m[1], 1, total), to: total });
-    } else if ((m = t.match(/^-\s*(\d+)$/))) {
-      out.push({ from: 1, to: clamp(+m[1], 1, total) });
-    } else if ((m = t.match(/^\d+$/))) {
-      const a = clamp(+t, 1, total); out.push({ from: a, to: a });
-    }
+    };
+    if ((m = t.match(/^(\d+)\s*-\s*(\d+)$/))) ok(+m[1], +m[2]);
+    else if ((m = t.match(/^(\d+)\s*-$/))) ok(+m[1], total);
+    else if ((m = t.match(/^-\s*(\d+)$/))) ok(1, +m[1]);
+    else if ((m = t.match(/^\d+$/))) ok(+t, +t);
+    else bad.push(t);
   }
+  out.ranges = out;
+  out.bad = bad;
   return out;
 }
 
@@ -2768,6 +3545,7 @@ function mountSplit() {
   const mid = Math.ceil(total / 2);
   let spec = total === 1 ? '1' : fmtR(1, mid) + ', ' + fmtR(mid + 1, total);
   let every = 1;
+  let busy = false;
 
   $('#wb-actions').append(h('button', { class: 'btn primary', onclick: run }, ico('save'), 'Split & save'));
 
@@ -2803,10 +3581,20 @@ function mountSplit() {
     return parseRanges(spec, total);
   }
 
+  /* This used to end by calling panel(), which rebuilds the side panel — and
+     therefore the very input being typed into. Every keystroke replaced the
+     field, so the caret jumped to the end and a selection was lost. The panel
+     is rebuilt only when the mode changes now; preview touches the stage. */
   function preview() {
     const rs = ranges();
+    const bad = rs.bad || [];
     clear(stage);
     const wrap = h('div', { class: 'flist' });
+    if (bad.length) {
+      wrap.append(h('p', { style: 'color:var(--mark);font-size:13px' },
+        (bad.length === 1 ? 'This part is not a page range on a ' : 'These parts are not page ranges on a ') +
+        total + '-page document: ' + bad.join(', ') + '.'));
+    }
     if (!rs.length) {
       wrap.append(h('p', { style: 'color:var(--ink-2);font-size:13.5px' }, 'No valid ranges yet. Try something like 1-3, 5.'));
     } else {
@@ -2819,12 +3607,19 @@ function mountSplit() {
         rs.length === 1 ? 'Saves as one PDF' : `Saves as a zip of ${rs.length} PDFs`));
     }
     stage.append(wrap);
-    panel();
   }
 
   async function run() {
+    if (busy) { toast('Still splitting.', true); return; }
     const rs = ranges();
     if (!rs.length) { toast('Enter at least one valid range.', true); return; }
+    /* Every piece is held in memory until the zip is built, so a request for
+       hundreds of files is a request to run the tab out of memory. */
+    if (rs.length > MAX_PARTS) {
+      toast(`That is ${rs.length} separate files — more than this can hold in memory at once. Split it in batches of ${MAX_PARTS} or fewer.`, true);
+      return;
+    }
+    busy = true;
     progress(0.05);
     try {
       const src = await PDFDocument.load(S.doc.bytes.slice(0), { ignoreEncryption: true });
@@ -2850,9 +3645,10 @@ function mountSplit() {
       progress(1);
     } catch (e) {
       toast('Split failed: ' + (e.message || 'unknown error'), true);
-    } finally { setTimeout(() => progress(null), 400); }
+    } finally { busy = false; setTimeout(() => progress(null), 400); }
   }
 
+  panel();
   preview();
 }
 
@@ -2863,7 +3659,7 @@ function mountToImages() {
   });
   const side = $('#wb-side'); side.dataset.wanted = '1'; applySidePanel();
   const stage = $('#wb-stage');
-  let dpi = 150, fmt = 'png', quality = 0.9;
+  let dpi = 150, fmt = 'png', quality = 0.9, busy = false;
 
   $('#wb-actions').append(h('button', { class: 'btn primary', onclick: run }, ico('save'), 'Render & save'));
 
@@ -2892,21 +3688,35 @@ function mountToImages() {
   }
 
   async function run() {
+    if (busy) { toast('Still rendering.', true); return; }
+    const count = S.doc.pages.length;
+    /* Every page's image is held until the zip is written. At 300 dpi an A4
+       page is about 1 MB as PNG, so a long document asked for more than the tab
+       has — and it failed with nothing to show for the wait. */
+    if (count > MAX_PARTS) {
+      toast(`${count} pages at once is more than this can hold in memory. Use Split first, or render in batches of ${MAX_PARTS}.`, true);
+      return;
+    }
+    busy = true;
+    const mine = ownsScreen();
     progress(0.02);
     try {
       const scale = dpi / 72;
       const made = [];
-      for (let i = 1; i <= S.doc.pages.length; i++) {
+      for (let i = 1; i <= count; i++) {
         const cv = document.createElement('canvas');
         const p = await S.doc.pdf.getPage(i);
+        if (!mine()) return;
         const vp = p.getViewport({ scale });
         cv.width = Math.floor(vp.width); cv.height = Math.floor(vp.height);
         const ctx = cv.getContext('2d');
         if (fmt === 'jpeg') { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, cv.width, cv.height); }
         await p.render({ canvasContext: ctx, viewport: vp }).promise;
-        const blob = await new Promise(r => cv.toBlob(r, 'image/' + fmt, fmt === 'jpeg' ? quality : undefined));
+        const blob = await toBlobOrThrow(cv, 'image/' + fmt, fmt === 'jpeg' ? quality : undefined);
         made.push({ name: outName(S.doc.name, '-p' + String(i).padStart(2, '0'), fmt === 'png' ? '.png' : '.jpg'), blob });
-        progress(0.02 + 0.9 * (i / S.doc.pages.length));
+        /* let the canvas go now rather than at the end of the loop */
+        cv.width = cv.height = 0;
+        progress(0.02 + 0.9 * (i / count));
       }
       if (made.length === 1) await offerFile(made[0].name, made[0].blob);
       else {
@@ -2918,7 +3728,7 @@ function mountToImages() {
       progress(1);
     } catch (e) {
       toast('Render failed: ' + (e.message || 'unknown error'), true);
-    } finally { setTimeout(() => progress(null), 400); }
+    } finally { busy = false; setTimeout(() => progress(null), 400); }
   }
 
   const stageNote = h('div', { class: 'empty' }, h('div', { class: 'inner' },
@@ -2937,7 +3747,10 @@ function mountFromImages() {
   const stage = $('#wb-stage');
   const side = $('#wb-side'); side.dataset.wanted = '1'; applySidePanel();
   let imgs = [];
-  let size = 'fit', margin = 0;
+  let size = 'fit', margin = 0, busy = false;
+  /* Each picture added here holds a blob URL for its thumbnail; they belong to
+     this mount, so they go when it does. */
+  onCleanup(() => { for (const it of imgs) if (it.img && it.img.url) { try { URL.revokeObjectURL(it.img.url); } catch (e) {} } });
 
   $('#wb-actions').append(
     h('button', { class: 'btn', onclick: add }, ico('plus'), 'Add images'),
@@ -2973,7 +3786,11 @@ function mountFromImages() {
         grid.append(h('div', { class: 'thumb' }, shot,
           h('div', { class: 'ops' },
             h('button', { title: 'Move earlier', onclick: () => { if (i > 0) { [imgs[i - 1], imgs[i]] = [imgs[i], imgs[i - 1]]; draw(); } } }, ico('left')),
-            h('button', { title: 'Remove', onclick: () => { imgs.splice(i, 1); draw(); } }, ico('trash')),
+            h('button', { title: 'Remove', onclick: () => {
+              const [gone] = imgs.splice(i, 1);
+              if (gone && gone.img && gone.img.url) { try { URL.revokeObjectURL(gone.img.url); } catch (e) {} }
+              draw();
+            } }, ico('trash')),
             h('button', { title: 'Move later', onclick: () => { if (i < imgs.length - 1) { [imgs[i + 1], imgs[i]] = [imgs[i], imgs[i + 1]]; draw(); } } }, ico('right'))),
           h('span', { class: 'cap' }, `${i + 1} · ${it.img.w}×${it.img.h}`)));
       });
@@ -3003,12 +3820,16 @@ function mountFromImages() {
   }
 
   async function run() {
+    if (busy) { toast('Still building.', true); return; }
     if (!imgs.length) { toast('Add at least one image.', true); return; }
+    busy = true;
+    // the list as it is now: adding or removing a picture mid-build is not it
+    const plan = imgs.slice();
     progress(0.05);
     try {
       const out = await PDFDocument.create();
-      for (let i = 0; i < imgs.length; i++) {
-        const im = imgs[i].img;
+      for (let i = 0; i < plan.length; i++) {
+        const im = plan[i].img;
         const emb = im.fmt === 'png' ? await out.embedPng(im.bytes) : await out.embedJpg(im.bytes);
         if (size === 'fit') {
           const pg = out.addPage([emb.width, emb.height]);
@@ -3022,7 +3843,7 @@ function mountFromImages() {
           const w = emb.width * k, hh = emb.height * k;
           pg.drawImage(emb, { x: (pw - w) / 2, y: (ph - hh) / 2, width: w, height: hh });
         }
-        progress(0.05 + 0.9 * ((i + 1) / imgs.length));
+        progress(0.05 + 0.9 * ((i + 1) / plan.length));
       }
       const bytes = await out.save();
       progress(1);
@@ -3030,7 +3851,7 @@ function mountFromImages() {
       offerContinue(bytes, 'images.pdf');
     } catch (e) {
       toast('Could not build the PDF: ' + (e.message || 'unknown error'), true);
-    } finally { setTimeout(() => progress(null), 400); }
+    } finally { busy = false; setTimeout(() => progress(null), 400); }
   }
 
   draw();
@@ -3043,7 +3864,7 @@ function mountCompress() {
   });
   const side = $('#wb-side'); side.dataset.wanted = '1'; applySidePanel();
   const stage = $('#wb-stage');
-  let dpi = 110, quality = 0.62;
+  let dpi = 110, quality = 0.62, busy = false;
 
   $('#wb-actions').append(h('button', { class: 'btn primary', onclick: run }, ico('save'), 'Compress & save'));
 
@@ -3066,11 +3887,15 @@ function mountCompress() {
   }
 
   async function run() {
+    if (busy) { toast('Still compressing.', true); return; }
+    busy = true;
+    const mine = ownsScreen();
     progress(0.02);
     try {
       const out = await PDFDocument.create();
       const scale = dpi / 72;
       for (let i = 1; i <= S.doc.pages.length; i++) {
+        if (!mine()) return;
         const p = await S.doc.pdf.getPage(i);
         const vp = p.getViewport({ scale });
         const cv = document.createElement('canvas');
@@ -3078,7 +3903,7 @@ function mountCompress() {
         const ctx = cv.getContext('2d');
         ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, cv.width, cv.height);
         await p.render({ canvasContext: ctx, viewport: vp }).promise;
-        const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', quality));
+        const blob = await toBlobOrThrow(cv, 'image/jpeg', quality);
         const emb = await out.embedJpg(new Uint8Array(await blob.arrayBuffer()));
         const base = p.getViewport({ scale: 1 });
         const pg = out.addPage([base.width, base.height]);
@@ -3090,7 +3915,7 @@ function mountCompress() {
       showResult(bytes);
     } catch (e) {
       toast('Compression failed: ' + (e.message || 'unknown error'), true);
-    } finally { setTimeout(() => progress(null), 400); }
+    } finally { busy = false; setTimeout(() => progress(null), 400); }
   }
 
   function showResult(bytes) {
@@ -3172,11 +3997,29 @@ function wordLines(items, vp, page) {
     const m = pdfjsLib.Util.transform(vp.transform, it.transform);
     const size = Math.hypot(m[2], m[3]) || Math.hypot(m[0], m[1]);
     if (!size || size < 2) continue;
-    if (Math.abs(Math.atan2(m[1], m[0])) > 0.08) continue;      // rotated text
+    /* Drop text that is turned relative to the page, not text the PAGE turns.
+       vp.transform has already applied /Rotate, so a 90-degree scan came
+       through with every run at right angles to the x axis and the whole page
+       was discarded as "rotated" — a document that read as empty. Compare
+       against the dominant angle instead, which is worked out below. */
+    const ang = Math.atan2(m[1], m[0]);
     let real = '';
     try { if (page.commonObjs.has(it.fontName)) real = page.commonObjs.get(it.fontName).name || ''; } catch (e) {}
-    raw.push({ x: m[4], baseline: m[5], w: it.width || size * it.str.length * 0.5, size, str: it.str, face: real || it.fontName || '' });
+    raw.push({ x: m[4], baseline: m[5], w: it.width || size * it.str.length * 0.5, size, str: it.str, face: real || it.fontName || '', ang });
   }
+  /* The angle most of the characters on this page share is "upright" for this
+     page; anything more than a few degrees off it is a rotated stamp or a
+     sideways caption, and those are what the layout code cannot handle. */
+  const tally = new Map();
+  for (const r of raw) {
+    const q = Math.round(r.ang / (Math.PI / 2)) * (Math.PI / 2);
+    tally.set(q, (tally.get(q) || 0) + r.str.length);
+  }
+  let base = 0, bestN = -1;
+  for (const [q, n] of tally) if (n > bestN) { bestN = n; base = q; }
+  const kept = raw.filter(r => Math.abs(r.ang - base) < 0.08);
+  raw.length = 0;
+  raw.push(...kept);
   raw.sort((a, b) => (a.baseline - b.baseline) || (a.x - b.x));
 
   const lines = [];
@@ -3286,9 +4129,16 @@ function wordColour(hex) {
 /* A page crop goes out as JPEG once it is big enough for the saving to matter,
    and PNG below that so logos and line art stay crisp. Either way it is laid on
    white first: a rendered page has no backdrop of its own. */
-function cropToImage(canvas, pgW, pgH, r) {
+async function cropToImage(canvas, pgW, pgH, r) {
+  /* Without this, a canvas that was never rendered gave sx = sy = 0, every
+     dimension collapsed to Math.max(1, 0), and what went into the document was
+     a 1×1 white pixel stretched to the full size of the picture. Better to
+     return nothing and leave the picture out than to write a blank box over
+     it. */
+  if (!canvas || !canvas.width || !canvas.height || !(pgW > 0) || !(pgH > 0)) return null;
   const sx = canvas.width / pgW, sy = canvas.height / pgH;
   const w = Math.max(1, Math.round(r.w * sx)), h = Math.max(1, Math.round(r.h * sy));
+  if (w < 2 || h < 2) return null;
   const cut = document.createElement('canvas');
   cut.width = w; cut.height = h;
   const cx = cut.getContext('2d');
@@ -3296,19 +4146,27 @@ function cropToImage(canvas, pgW, pgH, r) {
   cx.drawImage(canvas, Math.round(r.x * sx), Math.round(r.y * sy),
     Math.round(r.w * sx), Math.round(r.h * sy), 0, 0, w, h);
   const big = w * h > 90000;
-  return new Promise(res => cut.toBlob(
-    b => res({ blob: b, ext: big ? 'jpeg' : 'png' }),
-    big ? 'image/jpeg' : 'image/png', 0.86));
+  try {
+    const blob = await toBlobOrThrow(cut, big ? 'image/jpeg' : 'image/png', 0.86);
+    return { blob, ext: big ? 'jpeg' : 'png' };
+  } catch (e) {
+    console.error('cropToImage', e);
+    return null;
+  }
 }
 
 /* ---- WordprocessingML fragments ---- */
 function wRun(text, fmt) {
   const f = fmt.font;
+  /* The children of w:rPr are a SEQUENCE in the schema, not a set: w:color
+     comes before w:sz, and Word refuses to open a file that has them the other
+     way round — it offers to repair it instead. LibreOffice does not mind,
+     which is exactly why this went unnoticed. */
   const rPr = '<w:rPr>' +
     `<w:rFonts w:ascii="${xmlEsc(f)}" w:hAnsi="${xmlEsc(f)}" w:cs="${xmlEsc(f)}"/>` +
     (fmt.bold ? '<w:b/>' : '') + (fmt.italic ? '<w:i/>' : '') +
-    `<w:sz w:val="${fmt.half}"/><w:szCs w:val="${fmt.half}"/>` +
     (fmt.color ? `<w:color w:val="${fmt.color}"/>` : '') +
+    `<w:sz w:val="${fmt.half}"/><w:szCs w:val="${fmt.half}"/>` +
     '</w:rPr>';
   return '<w:r>' + rPr + '<w:t xml:space="preserve">' + xmlEsc(text) + '</w:t></w:r>';
 }
@@ -3382,14 +4240,22 @@ async function convertToWord(opts, onStep) {
   for (let n = 1; n <= total; n++) {
     const page = await pdf.getPage(n);
     const vp = page.getViewport({ scale: 1 });
-    if (n === 1) { pageW = vp.width; pageH = vp.height; }
+    /* THIS page's size, not page one's. The crops and the colour samples are
+       taken from a canvas rendered at this page's own viewport, so measuring
+       against page one cut the pictures out of the wrong part of the image —
+       and on a page larger than the first, out of thin air. A report with one
+       landscape table page in it is the ordinary case, not a corner one. */
+    const pgW = vp.width, pgH = vp.height;
+    if (n === 1) { pageW = pgW; pageH = pgH; }
 
     const lines = wordLines((await page.getTextContent()).items, vp, page);
     const blocks = wordBlocks(lines);
     const rects = opts.images ? await wordImageRects(page, vp) : [];
 
+    let painted = false;
     if (needsPixels && (blocks.length || rects.length)) {
-      await renderToCanvas(n, opts.images ? 2 : 1, canvas);
+      await renderToCanvas(n, opts.images ? 2 : 1, canvas, true);
+      painted = true;
     }
 
     if (n === 1 && blocks.length) {
@@ -3398,6 +4264,10 @@ async function convertToWord(opts, onStep) {
       marginR = Math.max(18, pageW - Math.max(...blocks.map(b => b.x + b.w)));
       marginB = Math.max(18, pageH - Math.max(...blocks.map(b => b.y + b.h)));
     }
+    /* The column the text has to fit, on this page. A narrow first page
+       followed by a wide one used to clamp every tab stop of the wide page's
+       table to the same position, so the columns collapsed into one. */
+    const pgColW = Math.max(120, pgW - marginL - marginR);
 
     /* Blocks that share a row are table cells, not stacked paragraphs. Joining
        them with real tab stops keeps a price list looking like a price list
@@ -3417,13 +4287,13 @@ async function convertToWord(opts, onStep) {
       }
     }
 
-    const colW = pageW - marginL - marginR;
+    const colW = pgColW;
     const items = rows.map(r => ({ y: r.top, row: r })).concat(rects.map(r => ({ y: r.y, rect: r })));
     items.sort((a, b) => a.y - b.y);
 
     for (const item of items) {
       if (item.rect) {
-        const cut = await cropToImage(canvas, pageW, pageH, item.rect);
+        const cut = painted ? await cropToImage(canvas, pgW, pgH, item.rect) : null;
         if (!cut || !cut.blob) continue;
         const name = `image${media.length + 1}.${cut.ext}`;
         media.push({ name, blob: cut.blob });
@@ -3432,8 +4302,12 @@ async function convertToWord(opts, onStep) {
         // a picture wider than the column is scaled down rather than pushed off it
         let iw = item.rect.w, ih = item.rect.h;
         if (!opts.layout && iw > colW) { ih = ih * (colW / iw); iw = colW; }
+        /* hRule="exact" at exactly the picture's own height left no room for
+           the line box the drawing sits in, so the bottom edge of every
+           picture was clipped. "atLeast" lets the frame grow to fit. */
         const pPr = opts.layout
-          ? `<w:framePr w:w="${Math.round(item.rect.w * TW_PT)}" w:h="${Math.round(item.rect.h * TW_PT)}" w:hRule="exact" w:wrap="none" w:vAnchor="page" w:hAnchor="page" w:x="${Math.round(item.rect.x * TW_PT)}" w:y="${Math.round(item.rect.y * TW_PT)}"/>`
+          ? `<w:framePr w:w="${Math.round(item.rect.w * TW_PT)}" w:h="${Math.round(item.rect.h * TW_PT)}" w:hRule="atLeast" w:wrap="none" w:vAnchor="page" w:hAnchor="page" w:x="${Math.round(item.rect.x * TW_PT)}" w:y="${Math.round(item.rect.y * TW_PT)}"/>` +
+            '<w:spacing w:after="0" w:line="0" w:lineRule="auto"/>'
           : '<w:spacing w:before="120" w:after="120"/>' +
             (item.rect.x - marginL > 24 && iw < colW - 24 ? `<w:ind w:left="${Math.round((item.rect.x - marginL) * TW_PT)}"/>` : '');
         out.push('<w:p><w:pPr>' + pPr + '</w:pPr>' + wImage(rid, media.length, iw, ih) + '</w:p>');
@@ -3468,8 +4342,8 @@ async function convertToWord(opts, onStep) {
       cells.forEach((cell, ci) => {
         if (ci) runs.push('<w:r><w:tab/></w:r>');
         let colour = null;
-        if (opts.colour && canvas.width) {
-          const sm = sampleRun(canvas, pageW, pageH, { x: cell.x, y: cell.y, w: Math.max(6, cell.w), h: Math.max(6, cell.h) });
+        if (opts.colour && painted && canvas.width) {
+          const sm = sampleRun(canvas, pgW, pgH, { x: cell.x, y: cell.y, w: Math.max(6, cell.w), h: Math.max(6, cell.h) });
           if (!sm.busy) colour = wordColour(sm.fg);
         }
         cell.lines.forEach((l, li) => {
@@ -3490,28 +4364,51 @@ async function convertToWord(opts, onStep) {
         });
       });
 
-      const pPrBits = [];
-      if (style) pPrBits.push(`<w:pStyle w:val="${style}"/>`);
+      /* w:pPr's children are a SEQUENCE, and Word enforces it: pStyle, then
+         framePr, numPr, tabs, spacing, ind, jc. Emitting them in the order
+         they happened to be worked out — ind, then jc, then spacing, with
+         numPr ahead of pStyle — is a schema violation, and Word answers it
+         with the "unreadable content" repair dialog on any document with an
+         indented, centred or bulleted paragraph in it. In other words: nearly
+         all of them. Collect the pieces, then write them out in order. */
+      const pp = { pStyle: '', framePr: '', numPr: '', tabs: '', spacing: '', ind: '', jc: '' };
+      if (style) pp.pStyle = `<w:pStyle w:val="${style}"/>`;
       if (opts.layout) {
-        pPrBits.push(`<w:framePr w:w="${Math.round((b.w + b.size) * TW_PT)}" w:h="${Math.round((b.h + 2) * TW_PT)}" w:hRule="auto" w:wrap="none" w:vAnchor="page" w:hAnchor="page" w:x="${Math.round(b.x * TW_PT)}" w:y="${Math.round(b.y * TW_PT)}"/>`);
-        pPrBits.push(`<w:spacing w:after="0" w:line="${Math.round(b.lineH * TW_PT)}" w:lineRule="exact"/>`);
+        pp.framePr = `<w:framePr w:w="${Math.round((b.w + b.size) * TW_PT)}" w:h="${Math.round((b.h + 2) * TW_PT)}" w:hRule="auto" w:wrap="none" w:vAnchor="page" w:hAnchor="page" w:x="${Math.round(b.x * TW_PT)}" w:y="${Math.round(b.y * TW_PT)}"/>`;
+        pp.spacing = `<w:spacing w:after="0" w:line="${Math.round(b.lineH * TW_PT)}" w:lineRule="exact"/>`;
       } else {
         if (multi) {
-          const stops = cells.slice(1).map(c => `<w:tab w:val="left" w:pos="${Math.round(clamp(c.x - marginL, 0, colW - 20) * TW_PT)}"/>`).join('');
-          pPrBits.push('<w:tabs>' + stops + '</w:tabs>');
+          /* Positions that clamp onto each other are worse than none: two
+             columns on one stop makes Word fall back to its half-inch
+             defaults. Keep the distinct ones, in order, and drop a stop at
+             zero, which Word ignores anyway. */
+          const seen = new Set();
+          const stops = [];
+          for (const c of cells.slice(1)) {
+            const pos = Math.round(clamp(c.x - marginL, 0, Math.max(40, colW - 20)) * TW_PT);
+            if (pos <= 0 || seen.has(pos)) continue;
+            seen.add(pos);
+            stops.push(`<w:tab w:val="left" w:pos="${pos}"/>`);
+          }
+          if (stops.length) pp.tabs = '<w:tabs>' + stops.join('') + '</w:tabs>';
         }
-        if (numId) pPrBits.push(`<w:numPr><w:ilvl w:val="0"/><w:numId w:val="${numId}"/></w:numPr>`, '<w:pStyle w:val="ListParagraph"/>');
+        if (numId) {
+          pp.numPr = `<w:numPr><w:ilvl w:val="0"/><w:numId w:val="${numId}"/></w:numPr>`;
+          // numId is only set when there is no heading style, so this cannot clash
+          pp.pStyle = '<w:pStyle w:val="ListParagraph"/>';
+        }
         const indent = Math.round((b.x - marginL) * TW_PT);
-        if (!numId && !multi && indent > 140) pPrBits.push(`<w:ind w:left="${indent}"/>`);
+        if (!numId && !multi && indent > 140) pp.ind = `<w:ind w:left="${indent}"/>`;
         if (!multi) {
           const slackL = b.x - marginL, slackR = (marginL + colW) - (b.x + b.w);
-          if (slackL > 28 && Math.abs(slackL - slackR) < Math.max(10, b.size)) pPrBits.push('<w:jc w:val="center"/>');
+          if (slackL > 28 && Math.abs(slackL - slackR) < Math.max(10, b.size)) pp.jc = '<w:jc w:val="center"/>';
         }
         const after = Math.round(Math.min(360, Math.max(60, (b.size * 0.42) * TW_PT)));
         const line = Math.round(240 * (b.lineH / (b.size * 1.2)));
-        pPrBits.push(`<w:spacing w:after="${after}" w:line="${clamp(line, 180, 480)}" w:lineRule="auto"/>`);
+        pp.spacing = `<w:spacing w:after="${after}" w:line="${clamp(line, 180, 480)}" w:lineRule="auto"/>`;
       }
-      out.push('<w:p><w:pPr>' + pPrBits.join('') + '</w:pPr>' + runs.filter(Boolean).join('') + '</w:p>');
+      const pPrXml = pp.pStyle + pp.framePr + pp.numPr + pp.tabs + pp.spacing + pp.ind + pp.jc;
+      out.push('<w:p><w:pPr>' + pPrXml + '</w:pPr>' + runs.filter(Boolean).join('') + '</w:p>');
       stats.paras++;
       if (preview.length < 60) preview.push({
         str: cells.map(c => c.lines.map(l => l.str).join(c.flow && !opts.layout ? ' ' : '\n')).join('\t'),
@@ -3617,26 +4514,46 @@ function mountToWord() {
       h('span', { class: 'hint' }, hint));
   }
 
+  /* A conversion runs for several seconds over every page, reading `opts` as it
+     goes. Toggling a switch mid-run therefore changed the settings underneath
+     it: the pages already done kept the old shape and the rest took the new
+     one, so the file came out half flowing paragraphs and half pinned frames,
+     with the panel showing a state the document did not have — and because
+     run() returned early while busy, the change was never converted properly
+     either. Each run now works from a frozen copy, and a change made during one
+     is queued and run when it finishes. */
+  let pending = false;
   async function run() {
-    if (busy) return;
-    busy = true; saveBtn.disabled = true;
+    if (busy) { pending = true; return; }
+    busy = true; pending = false; saveBtn.disabled = true;
+    const mine = ownsScreen();
+    const settings = Object.assign({}, opts);
     clear(stage).append(h('div', { class: 'empty' }, h('div', { class: 'inner' },
       ico('word'), h('h3', null, 'Rebuilding the document…'),
       h('p', null, 'Reading every page, grouping the glyphs into paragraphs.'))));
     progress(0.04);
     try {
-      built = await convertToWord(opts, f => progress(0.04 + 0.92 * f));
+      const made = await convertToWord(settings, f => { if (mine()) progress(0.04 + 0.92 * f); });
+      if (!mine()) return;
+      built = made;
       progress(null);
       show();
     } catch (e) {
       progress(null);
       console.error(e);
+      if (!mine()) return;
+      built = null;
       clear(stage).append(h('div', { class: 'empty' }, h('div', { class: 'inner' },
         ico('file'), h('h3', null, 'Could not convert this document'),
         h('p', null, String(e && e.message || e)))));
       toast('Conversion failed.', true);
+    } finally {
+      busy = false;
+      if (mine()) {
+        saveBtn.disabled = !built;
+        if (pending) run();
+      }
     }
-    busy = false; saveBtn.disabled = !built;
   }
 
   function show() {
@@ -3724,22 +4641,40 @@ function captureGesture(el, ev, { move, end, cancel }) {
      events at all. */
   if (!captured) el = window;
   const onMove = e => { if (e.pointerId === id) move(e); };
+  let done = false;
   const finish = kind => e => {
     if (e && e.pointerId !== id) return;
+    if (done) return;
+    done = true;
     el.removeEventListener('pointermove', onMove);
     el.removeEventListener('pointerup', up);
     el.removeEventListener('pointercancel', cancelled);
     el.removeEventListener('lostpointercapture', cancelled);
+    /* Without capture there is no lostpointercapture to fall back on, and a
+       release outside the window never reaches us either — so these two catch
+       the gesture that would otherwise have left its listeners on the window
+       for the life of the tab. A stale handler is worse than a leak: the mouse
+       reuses pointerId 1, so the next stroke's samples were being appended to
+       the abandoned one. */
+    window.removeEventListener('blur', cancelled);
+    document.removeEventListener('visibilitychange', onHide);
     if (captured) { try { el.releasePointerCapture(id); } catch (e2) {} }
     if (kind === 'up') end && end(e);
-    else (cancel || end) && (cancel || end)(e);
+    /* An explicit cancel means the system took the gesture away — a scroll
+       taking over, the pencil's own cancellation, the window losing focus. It
+       must not fall through to end(), which commits: an erase the OS cancelled
+       was still destroying whatever the half-drawn rubber had passed over. */
+    else if (cancel) cancel(e);
   };
   const up = finish('up');
   const cancelled = finish('cancel');
+  const onHide = () => { if (document.visibilityState === 'hidden') cancelled(); };
   el.addEventListener('pointermove', onMove);
   el.addEventListener('pointerup', up);
   el.addEventListener('pointercancel', cancelled);
   el.addEventListener('lostpointercapture', cancelled);
+  window.addEventListener('blur', cancelled);
+  document.addEventListener('visibilitychange', onHide);
 }
 
 /* A stroke is stored as [x, y, width]. Consecutive segments of a similar width
@@ -3775,14 +4710,122 @@ function inkPathData(pts, ox, oy) {
    only ever takes away things you added; the document's own ink is not its
    business — that is what a white Box is for. */
 
+/* The brightness/contrast/saturation/greyscale a lifted picture carries, as a
+   CSS filter. This lives at the top level because the eraser needs it too:
+   while it was a local inside mountEditor, rubbing out any picture threw a
+   ReferenceError that the eraser's own catch reported as "that object could
+   not be rubbed out". */
+function cssFilter(f) {
+  return `brightness(${f.b}%) contrast(${f.c}%) saturate(${f.s}%) grayscale(${f.g}%)`;
+}
+
+/* How a text object wraps, and therefore how tall it is. A text annotation
+   carries a width but no height — the lines fall out of the wrap — so anything
+   that needs its box has to lay the text out first. Measured with a canvas
+   context rather than the PDF metrics, because this is used for hit-testing
+   and re-drawing on screen, where the browser's wrap is the truth. */
+let TEXTMEASURE = null;
+function textLines(a) {
+  const text = String(a.text == null ? '' : a.text);
+  const width = a.w > 0 ? a.w : 0;
+  if (!width) return text.split('\n');
+  let ctx = TEXTMEASURE;
+  if (!ctx) {
+    try { ctx = TEXTMEASURE = document.createElement('canvas').getContext('2d'); } catch (e) { ctx = null; }
+  }
+  if (!ctx) return text.split('\n');
+  const wt = /Bold/.test(a.font || '') ? 700 : 400;
+  const st = /Italic|Oblique/.test(a.font || '') ? 'italic' : 'normal';
+  ctx.font = `${st} ${wt} ${a.size}px ${fontCss(a.font)}`;
+  const out = [];
+  for (const para of text.split('\n')) {
+    let line = '';
+    /* split, not trim: the capture keeps the run of spaces the user typed, so
+       a line that is deliberately indented stays indented. */
+    for (const word of para.split(/(\s+)/)) {
+      if (!word) continue;
+      const probe = line + word;
+      if (line && !/^\s+$/.test(word) && ctx.measureText(probe).width > a.w) { out.push(line); line = word; }
+      else line = probe;
+    }
+    out.push(line);
+  }
+  return out;
+}
+function textHeight(a) {
+  const lh = a.lh || a.size * 1.22;
+  return (textLines(a).length - 1) * lh + a.size * 1.1;
+}
+
+/* The narrowest a text box may ever be. A box narrower than its own letters
+   lays them out one per line — the text runs vertically down the page — so
+   every path that sets a width goes through this floor. Five times the type
+   size is roughly five or six characters: narrow, but still a line of text
+   rather than a column of letters. */
+function minTextWidth(a) { return Math.max(40, (a.size || 12) * 5); }
+
+/* The last line of defence, and the only one that cannot be gone round.
+
+   Clamping at each place a width is SET only works if every such place is
+   known — and one was not: a box reached the page 25px wide and laid out one
+   letter per line. So the width is repaired here instead, where the object is
+   about to be drawn or written out, whatever put it in that state: an older
+   build, a file edited by one, a path still unaccounted for. */
+function fixTextBox(a, pageW) {
+  if (a.type !== 'text') return a;
+  if (!Number.isFinite(a.size) || a.size < 1) a.size = 12;
+  const min = minTextWidth(a);
+  if (!Number.isFinite(a.w) || a.w < min) a.w = min;
+  if (Number.isFinite(pageW) && pageW > 0 && Number.isFinite(a.x)) {
+    // never wider than the sheet, and pulled back on if it hangs off the edge
+    a.w = Math.min(a.w, Math.max(min, pageW - 4));
+    if (a.x + a.w > pageW - 2) a.x = Math.max(2, pageW - 2 - a.w);
+  }
+  return a;
+}
+
+/* A comment is an arrow with a boxed note at its tail. The arrow leaves
+   whichever edge of the note faces the thing being pointed at, so it never
+   crosses its own label, and the note is laid out exactly as a text box is. */
+function calloutGeom(a) {
+  const size = a.size || 12;
+  const bw = Math.max(1, a.strokeW || 1.5);
+  const pad = Math.max(3, size * 0.38);
+  const inner = Math.max(a.w || 0, size * 4);
+  const lh = a.lh || size * 1.3;
+  const lines = textLines({ text: a.text, w: inner, size, font: a.font, lh });
+  const textH = (lines.length - 1) * lh + size * 1.15;
+  const label = { x: a.lx, y: a.ly, w: inner + (pad + bw) * 2, h: textH + (pad + bw) * 2 };
+  const tip = { x: a.x, y: a.y };
+  const cx = label.x + label.w / 2, cy = label.y + label.h / 2;
+  const dx = tip.x - cx, dy = tip.y - cy;
+  let from = { x: cx, y: cy };
+  if (dx || dy) {
+    // walk out from the centre until one of the two edges is reached
+    const t = Math.min(dx ? (label.w / 2) / Math.abs(dx) : Infinity,
+                       dy ? (label.h / 2) / Math.abs(dy) : Infinity);
+    from = { x: cx + dx * t, y: cy + dy * t };
+  }
+  const x0 = Math.min(label.x, tip.x), y0 = Math.min(label.y, tip.y);
+  const x1 = Math.max(label.x + label.w, tip.x), y1 = Math.max(label.y + label.h, tip.y);
+  return { label, tip, from, pad, bw, lines, lh, size, inner,
+           box: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } };
+}
+
 function shapeBox(a) {
-  if (a.type === 'arrow') {
+  if (a.type === 'callout') return calloutGeom(a).box;
+  if (a.type === 'arrow' || a.type === 'line') {
     return { x: Math.min(a.x, a.x + a.w), y: Math.min(a.y, a.y + a.h), w: Math.abs(a.w), h: Math.abs(a.h) };
   }
   if (a.pts && a.pts.length) {
     const xs = a.pts.map(p => p[0]), ys = a.pts.map(p => p[1]);
     return { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) };
   }
+  /* A text object's height is not stored anywhere, so without this the eraser
+     saw a box of zero height: rubbing across the words registered no hit at
+     all, and when it did hit, the replacement canvas was shorter than the
+     first baseline and the text came back blank. */
+  if (a.type === 'text') return { x: a.x, y: a.y, w: a.w || 0, h: textHeight(a) };
   return { x: a.x, y: a.y, w: a.w || 0, h: a.h || 0 };
 }
 
@@ -3804,9 +4847,34 @@ function underRubber(x, y, stroke, r) {
   return false;
 }
 
+/* distance from a point to a rectangle, zero inside it */
+function boxDist(px, py, box) {
+  const dx = Math.max(box.x - px, 0, px - (box.x + box.w));
+  const dy = Math.max(box.y - py, 0, py - (box.y + box.h));
+  return Math.hypot(dx, dy);
+}
+
+/* Does the rubber's swept path come within r of this box? Testing only the
+   sample points treated the rubber as a row of dots: dragged quickly, with one
+   move per frame, the samples land ~17pt apart while the rubber is 14pt wide,
+   so a line crossing between two of them was missed and the whole gesture was
+   silently a no-op. Walking the segments tests the path the rubber actually
+   travelled. */
 function rubberHitsBox(box, stroke, r) {
-  for (const [x, y] of stroke.pts) {
-    if (x >= box.x - r && x <= box.x + box.w + r && y >= box.y - r && y <= box.y + box.h + r) return true;
+  const p = stroke.pts;
+  if (!p.length) return false;
+  if (boxDist(p[0][0], p[0][1], box) <= r) return true;
+  for (let i = 1; i < p.length; i++) {
+    const [x1, y1] = p[i - 1], [x2, y2] = p[i];
+    if (boxDist(x2, y2, box) <= r) return true;
+    /* sample along the segment at a fraction of the rubber's own radius, which
+       cannot step over a box the rubber would have covered */
+    const len = Math.hypot(x2 - x1, y2 - y1);
+    const steps = Math.min(64, Math.ceil(len / Math.max(1, r * 0.5)));
+    for (let s = 1; s < steps; s++) {
+      const t = s / steps;
+      if (boxDist(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, box) <= r) return true;
+    }
   }
   return false;
 }
@@ -3823,7 +4891,11 @@ function splitInk(a, stroke, r) {
     else if (cur.length) { runs.push(cur); cur = []; }
   });
   if (cur.length) runs.push(cur);
-  return runs.filter(run => run.length > 1);
+  /* Keep a run of one point as well. Dropping those threw away the ink either
+     side of a small rub — on a short stroke it erased the whole thing — and a
+     single point is a dot the pen itself can draw, so there is nothing here
+     that cannot be rendered or exported. */
+  return runs.filter(run => run.length >= 1);
 }
 
 /* ---- drawing an object onto a 2D context, for the rubbed-out case ---- */
@@ -3847,6 +4919,32 @@ function paintAnnot(ctx, a, k, ox, oy) {
     ctx.beginPath();
     ctx.moveTo(head.l[0] * k, head.l[1] * k); ctx.lineTo(x2, y2); ctx.lineTo(head.r[0] * k, head.r[1] * k);
     ctx.stroke();
+  } else if (a.type === 'line') {
+    ctx.beginPath();
+    ctx.moveTo(a.x * k, a.y * k);
+    ctx.lineTo((a.x + a.w) * k, (a.y + a.h) * k);
+    ctx.stroke();
+  } else if (a.type === 'callout') {
+    const g = calloutGeom(a);
+    const stem = { x: g.from.x, y: g.from.y, w: g.tip.x - g.from.x, h: g.tip.y - g.from.y, strokeW: a.strokeW };
+    const head = arrowHead(stem);
+    ctx.lineWidth = Math.max(0.5, g.bw * k);
+    ctx.beginPath(); ctx.moveTo(g.from.x * k, g.from.y * k); ctx.lineTo(g.tip.x * k, g.tip.y * k); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(head.l[0] * k, head.l[1] * k); ctx.lineTo(g.tip.x * k, g.tip.y * k); ctx.lineTo(head.r[0] * k, head.r[1] * k);
+    ctx.stroke();
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(g.label.x * k, g.label.y * k, g.label.w * k, g.label.h * k);
+    ctx.strokeRect(g.label.x * k, g.label.y * k, g.label.w * k, g.label.h * k);
+    ctx.fillStyle = a.color || '#000';
+    const fam = fontCss(a.font);
+    const wt = /Bold/.test(a.font || '') ? 700 : 400;
+    ctx.font = `${wt} ${a.size * k}px ${fam}`;
+    ctx.textBaseline = 'alphabetic';
+    g.lines.forEach((line, i) => {
+      ctx.fillText(line, (g.label.x + g.pad + g.bw) * k,
+        (g.label.y + g.pad + g.bw + a.size * 0.84) * k + i * g.lh * k);
+    });
   } else if (a.type === 'hl') {
     ctx.globalAlpha = 0.55;
     ctx.fillRect(a.x * k, a.y * k, a.w * k, a.h * k);
@@ -3867,7 +4965,9 @@ function paintAnnot(ctx, a, k, ox, oy) {
     ctx.font = `${st} ${wt} ${a.size * k}px ${fam}`;
     ctx.textBaseline = 'alphabetic';
     const lh = (a.lh || a.size * 1.22) * k;
-    String(a.text || '').split('\n').forEach((line, i) => {
+    /* the same wrap the screen uses, so a re-drawn block keeps its line breaks
+       instead of running off the right edge as one long line */
+    textLines(a).forEach((line, i) => {
       ctx.fillText(line, a.x * k, (a.y + a.size * 0.82) * k + i * lh);
     });
   }
@@ -3929,7 +5029,7 @@ async function rubberise(a, strokes) {
   ctx.globalCompositeOperation = 'source-over';
 
   /* The export path embeds bytes, not a data URL, so hand back both. */
-  const blob = await new Promise(res => cv.toBlob(res, 'image/png'));
+  const blob = await toBlobOrThrow(cv, 'image/png');
   const bytes = new Uint8Array(await blob.arrayBuffer());
   return {
     id: uid(), type: 'img', page: a.page, x, y, w, h,
@@ -4139,15 +5239,27 @@ async function ocrEngine(onLog) {
   TESS_BUSY = (async () => {
     if (onLog) onLog({ status: 'loading language traineddata', progress: 0 });
     const data = await ocrModel();
-    const spawn = blobURL => Promise.race([
-      Tesseract.createWorker([{ code: 'eng', data }], 1, {
+    /* Racing a timeout only settles the race — the attempt behind it carries
+       on, and if it finished later nobody was left holding it, so a slow start
+       followed by the retry below left a whole engine (wasm core plus the
+       English model) running with no way to reach it. Terminate the loser. */
+    const spawn = blobURL => {
+      const task = Tesseract.createWorker([{ code: 'eng', data }], 1, {
         workerPath: ocrUrl('lib/tess/worker.min.js'),
         corePath: ocrUrl('lib/tess/core'),
         workerBlobURL: blobURL,
         logger: m => { if (onLog) onLog(m); }
-      }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('the engine did not finish starting within 45 seconds')), 45000))
-    ]);
+      });
+      let lost = false;
+      task.then(w => { if (lost) { try { w.terminate(); } catch (e) {} } }, () => {});
+      return Promise.race([
+        task,
+        new Promise((_, rej) => setTimeout(() => {
+          lost = true;
+          rej(new Error('the engine did not finish starting within 45 seconds'));
+        }, 45000))
+      ]);
+    };
     let w;
     try {
       w = await spawn(true);
@@ -4158,7 +5270,23 @@ async function ocrEngine(onLog) {
     TESS = w; TESS_BUSY = null;
     return w;
   })();
+  /* A failed start must not leave the shared promise behind, or every later
+     attempt returns the same rejection without ever trying again. */
+  TESS_BUSY.catch(() => { TESS_BUSY = null; });
   return TESS_BUSY;
+}
+
+/* Give the engine back. Nothing ever did this: a failed read followed by "Read
+   again" left the old worker running, holding the wasm core and the ~13 MB
+   model, and they stacked up for the life of the tab. The model BYTES are kept,
+   so starting again is quick and needs no fetch. */
+async function ocrRelease() {
+  const w = TESS, busy = TESS_BUSY;
+  TESS = TESS_BUSY = null;
+  if (w) { try { await w.terminate(); } catch (e) {} }
+  if (busy) {
+    try { const late = await busy; if (late && late !== w) await late.terminate(); } catch (e) {}
+  }
 }
 
 /* pdf.js hands back the words of a page that already has text; no point
@@ -4209,7 +5337,15 @@ function mountOCR() {
 
   const opts = { dpi: 300, skipText: true, contrast: true, sharpen: true, floor: 40, psm: 3 };
   const pages = [];            // {n, w, h, canvas, layer, words, text, state}
-  let running = false, done = 0, note = null;
+  let running = false, done = 0, note = null, stop = false;
+
+  /* Leaving the tool, or opening another document, ends the run. Without this
+     a read carried on in the background and kept calling sheet(), which clears
+     the shared stage — so it wiped whatever tool had been opened in the
+     meantime and drew its own page boxes there instead. */
+  const mine = ownsScreen();
+  const alive = () => !stop && mine();
+  onCleanup(() => { stop = true; ocrRelease(); });
 
   const saveBtn = h('button', { class: 'btn primary', disabled: true, onclick: () => saveSearchable() }, ico('save'), 'Save searchable PDF');
   const txtBtn = h('button', { class: 'btn sm', disabled: true, onclick: () => offerFile(outName(S.doc.name, '', '.txt'), allText()) }, 'Save .txt');
@@ -4271,15 +5407,27 @@ function mountOCR() {
           ...[[3, 'Work it out'], [4, 'One column'], [6, 'One block'], [11, 'Scattered text']].map(([v, t]) =>
             h('option', { value: v, selected: opts.psm === v }, t))),
         h('span', { class: 'hint' }, 'Leave it to work the page out unless the result comes back jumbled.')),
-      h('button', {
-        class: 'btn primary', style: 'width:100%;justify-content:center',
-        disabled: running, onclick: () => start()
-      }, ico(running ? 'undo' : 'check'), running ? 'Reading…' : (done ? 'Read again' : 'Read the document')),
+      running
+        /* A read of a long scan takes minutes, and until now there was no way
+           to call it off short of leaving the tool. */
+        ? h('button', {
+            class: 'btn danger', style: 'width:100%;justify-content:center',
+            onclick: e => {
+              stop = true;
+              e.currentTarget.disabled = true;
+              e.currentTarget.textContent = 'Stopping after this page\u2026';
+            }
+          }, 'Stop reading')
+        : h('button', {
+            class: 'btn primary', style: 'width:100%;justify-content:center',
+            onclick: () => start()
+          }, ico('check'), done ? 'Read again' : 'Read the document'),
+      running ? h('p', { class: 'hint', style: 'margin-top:8px' }, `Reading page ${Math.min(done + 1, pages.length)} of ${pages.length}…`) : null,
       note,
       h('details', { style: 'margin-top:16px;font-size:12px;color:var(--ink-2)' },
         h('summary', { style: 'cursor:pointer;color:var(--ink-3)' }, 'How this works'),
         h('p', { style: 'margin-top:8px' },
-          'Tesseract runs as WebAssembly in this tab, with the English model served from the page itself — about 11 MB, fetched once when you open this tool. Saving writes the words back into the PDF as an invisible text layer over the picture, which is what makes a scan searchable in any reader.'),
+          'Tesseract runs as WebAssembly in this tab, with the English model served from the page itself — about 13 MB, fetched once, the first time you read a page. After that it is held in memory and works with the internet switched off, like the rest of the app. Saving writes the words back into the PDF as an invisible text layer over the picture, which is what makes a scan searchable in any reader.'),
         h('p', { style: 'margin-top:8px;color:var(--mark)' },
           'Recognition is never perfect. Expect mistakes in small type, handwriting, heavy skew or a poor scan — the picture of the page is never altered, so nothing is lost.'))
     );
@@ -4322,11 +5470,23 @@ function mountOCR() {
 
   async function start() {
     if (running) return;
-    running = true; done = 0; note = null; panel();
+    running = true; stop = false; done = 0; note = null; panel();
     saveBtn.disabled = txtBtn.disabled = copyBtn.disabled = true;
     pages.length = 0;
     const total = S.doc.pages.length;
-    const scale = opts.dpi / 72;
+    /* iOS Safari refuses a canvas over about 16 million pixels and hands back a
+       blank one, with no error — at 300 dpi an A4 page is 8.7 M, which was
+       doubled to 34.8 M by the device pixel ratio the renderer used to add. So:
+       render at exactly the dpi asked for, and cap the area, telling Tesseract
+       the dpi it really got. Its layout and point-size heuristics depend on
+       that number being true. */
+    const AREA_CAP = 13e6;
+    let shrunk = 0;
+    const scaleFor = pg => {
+      let s = opts.dpi / 72;
+      if (pg.w * pg.h * s * s > AREA_CAP) { s = Math.sqrt(AREA_CAP / (pg.w * pg.h)); shrunk++; }
+      return s;
+    };
     let pre = null;
 
     try {
@@ -4354,10 +5514,18 @@ function mountOCR() {
       });
 
       for (let i = 0; i < pages.length; i++) {
+        /* Two different kinds of stop: the screen no longer belongs to this run
+           (leave at once, touch nothing), or the user asked it to stop (finish
+           up and show what was read). */
+        if (!mine()) return;
+        if (stop) break;
         const p = pages[i];
         p.state = 'reading'; sheet(); paintAll();
         const shot = document.createElement('canvas');
-        await renderToCanvas(p.n, scale, shot);
+        const s = scaleFor(S.doc.pages[p.n - 1]);
+        const effDpi = Math.max(70, Math.round(s * 72));
+        await renderToCanvas(p.n, s, shot, true);
+        if (!mine()) return;
         p.px = shot.width;
         /* The viewer's copy is this same bitmap scaled down, rather than a
            second trip through the renderer — on a three-page scan that is half
@@ -4386,11 +5554,12 @@ function mountOCR() {
         } else {
           await worker.setParameters({
             tessedit_pageseg_mode: String(opts.psm),
-            user_defined_dpi: String(opts.dpi),
+            user_defined_dpi: String(effDpi),
             preserve_interword_spaces: '1'
           });
           const prepared = (opts.contrast || opts.sharpen) ? prepForOcr(shot, opts) : shot;
           const { data } = await worker.recognize(prepared, {}, { text: true, blocks: true });
+          if (!mine()) return;
           const all = ocrWords(data).filter(w => (w.text || '').trim());
           const sure = w => w.confidence == null || w.confidence >= opts.floor;
           p.dropped = opts.floor > 0 ? all.filter(w => !sure(w)).length : 0;
@@ -4422,14 +5591,17 @@ function mountOCR() {
       const binned = pages.reduce((a, p) => a + (p.dropped || 0), 0);
       note = h('p', { class: 'hint', style: 'margin-top:10px' }, read
         ? `${read.toLocaleString()} words recognised` + (binned ? `, ${binned} too unclear to trust` : '') +
-          (skipped ? `, ${skipped} page${skipped === 1 ? '' : 's'} already had text` : '') + '. Drag across the page to select.'
+          (skipped ? `, ${skipped} page${skipped === 1 ? '' : 's'} already had text` : '') +
+          (shrunk ? `. ${shrunk} page${shrunk === 1 ? ' was' : 's were'} read at a lower resolution than asked for — this browser will not make a bitmap that large` : '') +
+          '. Drag across the page to select.'
         : `Every page already carries its own text, so there was nothing to recognise. Select and copy from the page, or take the text out with Save .txt.`);
       saveBtn.disabled = !read;
       txtBtn.disabled = copyBtn.disabled = !pages.some(p => p.text);
     } catch (e) {
       progress(null);
       console.error(e);
-      TESS = TESS_BUSY = null;
+      await ocrRelease();
+      if (!alive()) { running = false; return; }
       const d = (typeof pre !== 'undefined' && pre && pre.wasm) ? pre : await ocrDiagnose().catch(() => ({}));
       const bad = d.wasm && d.wasm !== 'ok' ? 'WebAssembly is switched off in this view'
         : d.worker && d.worker !== 'ok' ? 'background workers are switched off in this view'
@@ -4444,9 +5616,12 @@ function mountOCR() {
           '\npaths:  ' + (d.base || '?') +
           '\nthrew:  ' + String(e && e.message || e).slice(0, 160)));
       toast('OCR could not run here.', true);
+    } finally {
+      /* in a finally, so the early returns that bail out of a cancelled run
+         cannot leave the tool thinking it is still reading */
+      running = false;
+      if (alive()) panel();
     }
-    running = false;
-    panel();
   }
 
   function paintAll() { pages.forEach(paintWords); }
@@ -4466,7 +5641,24 @@ function mountOCR() {
         if (!p.words || !p.words.length) continue;
         const page = list[i];
         if (!page) continue;
-        const { height: H } = page.getSize();
+        /* The boxes are in the recogniser's image pixels, which came from a
+           pdf.js viewport — so they are in the page's CROP box, already turned
+           the right way up by its /Rotate. The invisible text has to be laid
+           back into PDF user space, which is neither: scanner output very often
+           carries /Rotate 90, and writing the words straight out left them
+           transposed and mostly off the sheet, so a search found nothing. Same
+           transform the editor's own export uses. */
+        const crop = pageCrop(page);
+        const R = ((page.getRotation().angle % 360) + 360) % 360;
+        const W = crop.width, H = crop.height;
+        const place = (dx, dy, dh) => {
+          let q;
+          if (R === 90) q = { x: dy + dh, y: dx };
+          else if (R === 180) q = { x: W - dx, y: dy + dh };
+          else if (R === 270) q = { x: W - dy - dh, y: H - dx };
+          else q = { x: dx, y: H - dy - dh };
+          return { x: q.x + crop.x, y: q.y + crop.y };
+        };
         const k = p.ptW / p.px;                 // image pixels -> PDF points
         page.pushOperators(pushGraphicsState(), setTextRenderingMode(TextRenderingMode.Invisible));
         for (const w of p.words) {
@@ -4478,7 +5670,8 @@ function mountOCR() {
           const unit = font.widthOfTextAtSize(t, 100) / 100;
           let size = unit > 0.01 ? bw / unit : bh;
           size = clamp(size, Math.max(1, bh * 0.45), bh * 1.6);
-          page.drawText(t, { x: b.x0 * k, y: H - (b.y1 * k) + bh * 0.18, size, font });
+          const at = place(b.x0 * k, b.y1 * k - bh * 0.18, 0);
+          page.drawText(t, { x: at.x, y: at.y, size, font, rotate: degrees(R) });
           written++;
         }
         page.pushOperators(popGraphicsState());
@@ -4628,6 +5821,16 @@ function fitBrand() {
 /* ------------------------------------------------------------------- boot */
 function boot() {
   buildHome();
+  /* The renderer's worker is a separate 1.1 MB file that pdf.js only asks for
+     when the first document opens — so a page that had been loaded but never
+     used would still need the network. Pull it in now and keep it as a blob in
+     memory, which no cache policy and no offline switch can take away. */
+  try {
+    fetch('lib/pdf.worker.min.js')
+      .then(r => r.ok ? r.blob() : null)
+      .then(b => { if (b) pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(b); })
+      .catch(() => {});
+  } catch (e) {}
   fitBrand();
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(fitBrand).catch(() => {});
   window.addEventListener('resize', fitBrand);
@@ -4651,7 +5854,7 @@ function boot() {
   dropTarget($('#home-drop'), go);
   $('#home-pick').addEventListener('click', async () => { const f = await pickFile('.pdf'); if (f) go([f]); });
   $('#home-sample').addEventListener('click', async () => {
-    try { await loadSample(); openTool('edit'); toast('Sample document opened — try the Sign tool on page 3'); }
+    try { await loadSample(); openTool('edit'); toast('Sample document opened — try Stamp & sign on page 3'); }
     catch (e) { console.error('sample build failed', e); toast('Could not build the sample.', true); }
   });
 
@@ -4659,21 +5862,577 @@ function boot() {
     if ($('#view-tool').hidden) return;
     const typing = /input|textarea/i.test(e.target.tagName) || e.target.isContentEditable;
     if (typing) return;
+    /* These used to reach for the first two buttons in the action bar, which is
+       only undo and redo in the editor. In Split the first button is "Split &
+       save"; in the reader it is Copy, so Cmd+Z replaced the clipboard and
+       Cmd+Shift+Z downloaded a text file. The tool now says what it offers, and
+       a tool that offers nothing gets nothing. */
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
-      e.preventDefault();
-      const b = $('#wb-actions').querySelectorAll('button');
-      if (b.length) (e.shiftKey ? b[1] : b[0]).click();
+      const act = S.keys && (e.shiftKey ? S.keys.redo : S.keys.undo);
+      if (act) { e.preventDefault(); act(); }
+      return;
     }
-    if ((e.key === 'Backspace' || e.key === 'Delete') && S.sel) {
+    if ((e.key === 'Backspace' || e.key === 'Delete') && S.sel && S.keys && S.keys.remove) {
       e.preventDefault();
-      S.undoStack.push(JSON.stringify(S.annots));
-      S.annots = S.annots.filter(x => x.id !== S.sel);
-      S.sel = null;
-      if (S.tool === 'edit') mount('edit');
+      S.keys.remove();
     }
     if (e.key === 'Escape') showHome();
   });
 }
+
+
+/* ========================================= ink from a photograph of paper
+
+   Ported from Ink & Seal (Monkey Marxist, AGPL-3.0). Photograph a signature or
+   a rubber stamp on white paper and this turns it into transparent ink: the
+   paper goes, the strokes keep their own colour, and what is left can be put on
+   a page without a white box around it.
+
+   The matte is the interesting part. A global threshold fails on a phone photo
+   because one corner of the page is always brighter than the other, so the
+   paper colour is estimated per tile and interpolated across the sheet. Each
+   pixel is then normalised against its local paper colour and the compositing
+   equation C = (1-a) + a*ink is solved for a and for the ink colour — which is
+   what stops fine strokes coming out with a white fringe, as they do when you
+   simply knock out everything near white. */
+
+function removePaper(source, cleanup = 12, strength = 1) {
+  const { width: w, height: h, data: src } = source;
+  const tile = Math.max(32, Math.round(Math.max(w, h) / 18));
+  const nx = Math.ceil(w / tile), ny = Math.ceil(h / tile);
+  const paper = new Float32Array(nx * ny * 3);
+  for (let gy = 0; gy < ny; gy++) for (let gx = 0; gx < nx; gx++) {
+    const samples = [];
+    for (let y = gy * tile; y < Math.min(h, (gy + 1) * tile); y += 3) {
+      for (let x = gx * tile; x < Math.min(w, (gx + 1) * tile); x += 3) {
+        const i = (y * w + x) * 4;
+        if (src[i + 3] < 240) continue;
+        samples.push({ i, light: 0.2126 * src[i] + 0.7152 * src[i + 1] + 0.0722 * src[i + 2] });
+      }
+    }
+    samples.sort((a, b) => b.light - a.light);
+    const count = Math.max(1, Math.ceil(samples.length * 0.18)), o = (gy * nx + gx) * 3;
+    if (!samples.length) { paper[o] = paper[o + 1] = paper[o + 2] = 255; continue; }
+    for (let j = 0; j < count; j++) for (let c = 0; c < 3; c++) paper[o + c] += src[samples[j].i + c] / count;
+  }
+  /* A local maximum over the tile grid, so a tile that happens to be filled
+     with dense ink does not decide that ink is what paper looks like. */
+  const expanded = new Float32Array(paper.length);
+  for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) for (let c = 0; c < 3; c++) {
+    let best = 96;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const xx = Math.min(nx - 1, Math.max(0, x + dx)), yy = Math.min(ny - 1, Math.max(0, y + dy));
+      best = Math.max(best, paper[(yy * nx + xx) * 3 + c]);
+    }
+    expanded[(y * nx + x) * 3 + c] = best;
+  }
+  const out = new Uint8ClampedArray(src.length), cutoff = cleanup / 100 * 0.30;
+  let minX = w, minY = h, maxX = -1, maxY = -1;
+  for (let y = 0; y < h; y++) {
+    const fy = Math.max(0, Math.min(ny - 1, y / tile - 0.5)), y0 = Math.floor(fy), y1 = Math.min(ny - 1, y0 + 1), ty = fy - y0;
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      if (src[i + 3] === 0) continue;
+      const fx = Math.max(0, Math.min(nx - 1, x / tile - 0.5)), x0 = Math.floor(fx), x1 = Math.min(nx - 1, x0 + 1), tx = fx - x0;
+      const normalized = [];
+      for (let c = 0; c < 3; c++) {
+        const top = expanded[(y0 * nx + x0) * 3 + c] * (1 - tx) + expanded[(y0 * nx + x1) * 3 + c] * tx;
+        const bottom = expanded[(y1 * nx + x0) * 3 + c] * (1 - tx) + expanded[(y1 * nx + x1) * 3 + c] * tx;
+        normalized[c] = Math.min(1, src[i + c] / Math.max(96, top * (1 - ty) + bottom * ty));
+      }
+      const density = 1 - Math.min(...normalized), matte = Math.max(0, (density - cutoff) / (1 - cutoff));
+      const alpha = Math.min(1, matte * strength) * src[i + 3] / 255;
+      if (alpha < 1 / 255) continue;
+      for (let c = 0; c < 3; c++) {
+        out[i + c] = 255 * Math.min(1, Math.max(0, (normalized[c] - (1 - density)) / Math.max(density, 0.001)));
+      }
+      out[i + 3] = Math.round(alpha * 255);
+      if (alpha > 0.015) { minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
+    }
+  }
+  if (maxX < minX || maxY < minY) return { width: 1, height: 1, offsetX: 0, offsetY: 0, image: new ImageData(1, 1), empty: true };
+  const pad = Math.max(3, Math.round(Math.max(maxX - minX, maxY - minY) * 0.012));
+  minX = Math.max(0, minX - pad); minY = Math.max(0, minY - pad);
+  maxX = Math.min(w - 1, maxX + pad); maxY = Math.min(h - 1, maxY + pad);
+  const width = maxX - minX + 1, height = maxY - minY + 1;
+  const trimmed = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    trimmed.set(out.subarray(((y + minY) * w + minX) * 4, ((y + minY) * w + minX + width) * 4), y * width * 4);
+  }
+  return { width, height, offsetX: minX, offsetY: minY, image: new ImageData(trimmed, width, height), empty: false };
+}
+
+/* Brightness, contrast, saturation and sharpness applied to the INK rather than
+   to the picture: the work is done on ink density, so a fully clear pixel stays
+   clear and the edges of a stroke do not grow a halo. */
+function adjustInk(source, options = {}) {
+  const brightness = clamp(options.brightness == null ? 0 : options.brightness, -50, 50);
+  const contrast = clamp(options.contrast == null ? 100 : options.contrast, 50, 200) / 100;
+  const saturation = clamp(options.saturation == null ? 100 : options.saturation, 0, 200) / 100;
+  const sharpness = clamp(options.sharpness == null ? 0 : options.sharpness, 0, 100) / 100;
+  const { width, height, data } = source;
+  if (!brightness && contrast === 1 && saturation === 1 && !sharpness) {
+    return new ImageData(new Uint8ClampedArray(data), width, height);
+  }
+  const densities = new Float32Array(width * height * 3);
+  const lightness = Math.pow(2, -brightness / 50);
+  for (let pixel = 0; pixel < width * height; pixel++) {
+    const i = pixel * 4, a = data[i + 3] / 255;
+    if (!a) continue;
+    const grey = (0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]) / 255;
+    for (let c = 0; c < 3; c++) {
+      const colour = clamp(grey + (data[i + c] / 255 - grey) * saturation, 0, 1);
+      densities[pixel * 3 + c] = Math.min(1, Math.pow(a * (1 - colour), 1 / contrast) * lightness);
+    }
+  }
+  const out = new Uint8ClampedArray(data.length);
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const pixel = y * width + x, i = pixel * 4;
+    if (!data[i + 3]) continue;
+    const d = [0, 0, 0];
+    for (let c = 0; c < 3; c++) {
+      let value = densities[pixel * 3 + c];
+      if (sharpness) {
+        let blurred = 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const xx = Math.min(width - 1, Math.max(0, x + dx)), yy = Math.min(height - 1, Math.max(0, y + dy));
+          blurred += densities[(yy * width + xx) * 3 + c] / 9;
+        }
+        value += 1.5 * sharpness * (value - blurred);
+      }
+      d[c] = clamp(value, 0, 1);
+    }
+    const a = Math.max(...d);
+    if (a < 1 / 255) continue;
+    out[i + 3] = Math.round(a * 255);
+    for (let c = 0; c < 3; c++) out[i + c] = Math.round(255 * (1 - d[c] / a));
+  }
+  return new ImageData(out, width, height);
+}
+
+/* ---- the saved ink library ----------------------------------------------
+
+   Kept in this browser, like everything else here: IndexedDB on this origin,
+   never sent anywhere. If storage is refused — a private window, a locked-down
+   profile — the library still works for the session and says so. */
+
+let INK_DB = null;
+function inkDb() {
+  if (INK_DB) return INK_DB;
+  INK_DB = new Promise((resolve, reject) => {
+    if (!window.indexedDB) return reject(new Error('no indexedDB'));
+    let req;
+    try { req = indexedDB.open('paperless-ink', 1); } catch (e) { return reject(e); }
+    req.onupgradeneeded = () => { try { req.result.createObjectStore('ink', { keyPath: 'id' }); } catch (e) {} };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('blocked'));
+    req.onblocked = () => reject(new Error('blocked'));
+  });
+  INK_DB.catch(() => { INK_DB = null; });
+  return INK_DB;
+}
+async function inkStore(action, value) {
+  const db = await inkDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('ink', action === 'getAll' ? 'readonly' : 'readwrite');
+    const req = tx.objectStore('ink')[action](value);
+    tx.oncomplete = () => resolve(req.result);
+    tx.onerror = tx.onabort = () => reject(tx.error || new Error('could not save'));
+  });
+}
+async function loadInkLibrary() {
+  try {
+    const rows = await inkStore('getAll');
+    S.ink = (rows || []).sort((a, b) => a.created - b.created);
+  } catch (e) {
+    S.ink = [];
+    S.inkVolatile = true;
+  }
+  return S.ink;
+}
+
+/* A saved item is a PNG data URL. The exporter wants real bytes, so decode it
+   once, here, rather than at save time — the bytes are what goes into the PDF
+   and the data URL is what the thumbnail and the page preview use. */
+function inkBytes(asset) {
+  if (asset._bytes) return asset._bytes;
+  /* Decoded by hand rather than with fetch(). A data: URL is not a network
+     resource, but fetch still goes through the page's connect-src policy, and
+     in a sandboxed frame that refusal is what made every saved signature fail
+     to place with "that saved ink could not be read". atob has no such
+     problem, and for a 60 KB PNG it is quicker anyway. */
+  const url = String(asset.data || '');
+  const comma = url.indexOf(',');
+  if (!/^data:/i.test(url) || comma < 0) throw new Error('not a data URL');
+  const body = url.slice(comma + 1);
+  let bin;
+  if (/;base64/i.test(url.slice(0, comma))) bin = atob(body);
+  else bin = decodeURIComponent(body);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  asset._bytes = bytes;
+  return bytes;
+}
+
+/* ---- the capture dialog --------------------------------------------------
+
+   Photograph → crop → matte → tidy up → save. The preview is recomputed on a
+   short timer rather than on every slider tick, because the matte is a full
+   pass over the photograph and a 12 megapixel phone picture is not free. The
+   expensive part is cached against its inputs, so moving a colour slider does
+   not redo the paper estimation. */
+
+function sealDialog(kind, onSaved) {
+  let source = null;              // ImageData of the photograph
+  let crop = null;                // {x,y,width,height} in source pixels
+  let matte = null;               // cache of the paper-removal result
+  let preview = null;             // ImageData currently on screen
+  let origin = { x: 0, y: 0 };    // where the preview sits in the source
+  let result = null;              // {data,width,height} ready to save
+  let mask = null;                // eraser: 255 keep, 0 erased, per source pixel
+  let strokes = [], erased = 0, erasing = false, timer = null, frame = null;
+
+  const opts = { cleanup: 12, strength: 100, brightness: 0, contrast: 100, saturation: 100, sharpness: 0 };
+  const DEFAULTS = { brightness: 0, contrast: 100, saturation: 100, sharpness: 0 };
+
+  const srcCanvas = h('canvas');
+  const outCanvas = h('canvas');
+  const cropBox = h('div', { class: 'inkcrop', hidden: true });
+  const brush = h('span', { class: 'inkbrush', hidden: true });
+  const status = h('p', { class: 'hint', style: 'min-height:32px' }, 'Upload a photo to begin.');
+  const nameField = h('input', { type: 'text', maxlength: '60', placeholder: 'My signature' });
+  const saveBtn = h('button', { class: 'btn primary', disabled: true }, ico('save'), 'Save');
+  const resetCrop = h('button', { class: 'linkbtn', hidden: true, onclick: () => { crop = null; cropBox.hidden = true; resetCrop.hidden = true; run(); } }, 'Reset crop');
+  const zoom = h('select', { onchange: sizeOut },
+    h('option', { value: 'fit', selected: true }, 'Fit'), h('option', { value: '1' }, '100%'),
+    h('option', { value: '2' }, '200%'), h('option', { value: '4' }, '400%'));
+  const eraseBtn = h('button', { class: 'btn sm', 'aria-pressed': 'false', onclick: toggleEraser }, ico('rub'), 'Eraser');
+  const brushSize = h('input', { type: 'range', min: '1', max: '80', value: '12' });
+  const undoErase = h('button', { class: 'btn sm', disabled: true, onclick: popStroke }, ico('undo'));
+  const restoreInk = h('button', { class: 'btn sm', disabled: true, onclick: () => { if (mask) mask.fill(255); strokes = []; erased = 0; run(); } }, 'Restore');
+  const outWrap = h('div', { class: 'inkout checker' }, h('div', { class: 'inkout-in' }, outCanvas, brush));
+  const srcWrap = h('div', { class: 'inksrc' }, srcCanvas, cropBox);
+
+  let inkKind = kind === 'stamp' ? 'stamp' : 'signature';
+  /* as strings: h() drops an attribute whose value is false, and the pressed
+     styling is keyed on [aria-pressed="true"] */
+  const kindSeg = h('div', { class: 'seg' },
+    h('button', { 'aria-pressed': String(inkKind === 'signature'), onclick: () => setKind('signature') }, 'Signature'),
+    h('button', { 'aria-pressed': String(inkKind === 'stamp'), onclick: () => setKind('stamp') }, 'Stamp'));
+  function setKind(k) {
+    inkKind = k;
+    for (const b of kindSeg.children) b.setAttribute('aria-pressed', String(b.textContent.toLowerCase() === k));
+    if (!nameField.value.trim() || /^My (signature|stamp)/.test(nameField.value)) nameField.value = defaultName();
+  }
+  const defaultName = () => {
+    const n = (S.ink || []).filter(a => a.kind === inkKind).length;
+    return 'My ' + inkKind + (n ? ' ' + (n + 1) : '');
+  };
+
+  function slider(label, key, min, max, suffix, note) {
+    const out = h('span', { class: 'val' }, opts[key] + (suffix || ''));
+    const input = h('input', {
+      type: 'range', min: String(min), max: String(max), value: String(opts[key]),
+      oninput: e => { opts[key] = +e.target.value; out.textContent = opts[key] + (suffix || ''); schedule(); }
+    });
+    return h('div', { class: 'field' }, h('label', null, label),
+      h('div', { class: 'rangerow' }, input, out),
+      note ? h('span', { class: 'hint' }, note) : null);
+  }
+
+  const picker = h('div', { class: 'inkpick' },
+    ico('scan'),
+    h('h3', null, 'Start with a photo, or draw it'),
+    h('p', null, 'A signature or a stamp on white paper. Even light, no shadow across it, and the whole mark in the frame. Or draw your signature here with a finger, a pencil or the mouse.'),
+    h('div', { class: 'row' },
+      h('button', { class: 'btn primary', 'data-pick': 'file', onclick: () => pick(false) }, ico('image'), 'Choose a photo'),
+      h('button', { class: 'btn', 'data-pick': 'camera', onclick: () => pick(true) }, 'Take a photo'),
+      h('button', {
+        class: 'btn', 'data-pick': 'draw',
+        onclick: () => {
+          /* The pad is a separate sheet, so this one steps aside first — two
+             stacked modals share one overlay and the lower one would be stuck
+             open behind the pad. */
+          const pad = S.drawSignature;
+          if (!pad) return toast('Open a document first, then draw your signature.', true);
+          if (close) close();
+          pad();
+        }
+      }, ico('sign'), 'Draw')),
+    h('p', { class: 'hint', style: 'margin-top:12px' }, 'Nothing you draw or photograph here leaves this tab.'));
+
+  const editor = h('div', { hidden: true },
+    h('div', { class: 'inkgrid' },
+      h('div', null,
+        h('div', { class: 'inklabel' }, h('span', null, 'Photo'), resetCrop),
+        srcWrap,
+        h('p', { class: 'hint' }, 'Drag across the photo to crop to the mark.')),
+      h('div', null,
+        h('div', { class: 'inklabel' }, h('span', null, 'Transparent ink'),
+          h('label', { class: 'inkzoom' }, 'Zoom', zoom)),
+        outWrap,
+        status)),
+    h('div', { class: 'inkrow2' },
+      slider('Paper cleanup', 'cleanup', 0, 65, '', 'Raise it to clear faint shadows and show-through.'),
+      slider('Ink strength', 'strength', 60, 160, '%', 'Leave at 100% for the ink as photographed.')),
+    h('div', { class: 'inkerase' },
+      eraseBtn,
+      h('label', null, 'Brush', brushSize),
+      undoErase, restoreInk,
+      h('p', { class: 'hint' }, 'Turn the eraser on and brush over anything the matte left behind — a ruled line, a crease, a speck.')),
+    h('details', { class: 'inkadj' },
+      h('summary', null, 'Colour and detail'),
+      h('div', { class: 'inkrow2' },
+        slider('Brightness', 'brightness', -50, 50, ''),
+        slider('Contrast', 'contrast', 50, 200, '%'),
+        slider('Saturation', 'saturation', 0, 200, '%'),
+        slider('Sharpness', 'sharpness', 0, 100, '')),
+      h('button', {
+        class: 'linkbtn', onclick: () => {
+          Object.assign(opts, DEFAULTS);
+          const ranges = editor.querySelectorAll('.inkadj input[type=range]');
+          const keys = ['brightness', 'contrast', 'saturation', 'sharpness'];
+          ranges.forEach((r, i) => {
+            r.value = String(DEFAULTS[keys[i]]);
+            const v = r.parentNode.querySelector('.val');
+            if (v) v.textContent = DEFAULTS[keys[i]] + (['contrast', 'saturation'].includes(keys[i]) ? '%' : '');
+          });
+          run();
+        }
+      }, 'Reset colour and detail')),
+    h('div', { class: 'field' }, h('label', null, 'Kind'), kindSeg),
+    h('div', { class: 'field' }, h('label', null, 'Name'), nameField));
+
+  let close = null;
+  close = modal(box => {
+    box.classList.add('wide');
+    box.append(
+      h('h3', null, 'Stamp & sign'),
+      h('p', null, 'Turn a photograph of a signature or a rubber stamp into transparent ink you can place on any page.'),
+      picker, editor,
+      h('div', { class: 'row' },
+        h('button', { class: 'btn', onclick: () => pick(false) }, 'Change photo'),
+        h('button', { class: 'btn', onclick: () => close && close() }, 'Cancel'),
+        saveBtn));
+    saveBtn.onclick = save;
+  }, () => { clearTimeout(timer); if (frame) cancelAnimationFrame(frame); });
+
+  /* ---- loading a photograph ---- */
+  async function pick(camera) {
+    const input = $('#filein');
+    if (camera) input.setAttribute('capture', 'environment'); else input.removeAttribute('capture');
+    const f = await pickFile('image/png,image/jpeg,image/webp');
+    input.removeAttribute('capture');
+    if (!f) return;
+    if (!/^image\//.test(f.type) && !/\.(png|jpe?g|webp)$/i.test(f.name)) return toast('Choose a JPG, PNG or WebP photo.', true);
+    const url = URL.createObjectURL(f);
+    try {
+      const im = new Image();
+      im.src = url;
+      await im.decode();
+      if (!im.naturalWidth || !im.naturalHeight) throw new Error('empty');
+      // 2400px on the long edge is plenty for a signature and keeps the matte quick
+      const k = Math.min(1, 2400 / Math.max(im.naturalWidth, im.naturalHeight));
+      const cv = document.createElement('canvas');
+      cv.width = Math.round(im.naturalWidth * k);
+      cv.height = Math.round(im.naturalHeight * k);
+      const cx = cv.getContext('2d', { willReadFrequently: true });
+      cx.drawImage(im, 0, 0, cv.width, cv.height);
+      source = cx.getImageData(0, 0, cv.width, cv.height);
+      crop = null; matte = null; strokes = []; erased = 0;
+      mask = new Uint8Array(cv.width * cv.height).fill(255);
+      srcCanvas.width = cv.width; srcCanvas.height = cv.height;
+      srcCanvas.getContext('2d').putImageData(source, 0, 0);
+      cropBox.hidden = true; resetCrop.hidden = true;
+      picker.hidden = true; editor.hidden = false;
+      nameField.value = defaultName();
+      run();
+    } catch (e) {
+      console.error(e);
+      toast('That image could not be read. Try a JPG or PNG.', true);
+    } finally { URL.revokeObjectURL(url); }
+  }
+
+  const schedule = () => { clearTimeout(timer); timer = setTimeout(run, 60); };
+
+  function run() {
+    if (!source) return;
+    const key = JSON.stringify(crop);
+    if (!matte || matte.key !== key || matte.cleanup !== opts.cleanup || matte.strength !== opts.strength) {
+      let image = source;
+      if (crop) {
+        const cv = document.createElement('canvas');
+        cv.width = source.width; cv.height = source.height;
+        const cx = cv.getContext('2d', { willReadFrequently: true });
+        cx.putImageData(source, 0, 0);
+        image = cx.getImageData(crop.x, crop.y, crop.width, crop.height);
+      }
+      matte = { key, cleanup: opts.cleanup, strength: opts.strength, out: removePaper(image, opts.cleanup, opts.strength / 100) };
+    }
+    const m = matte.out;
+    preview = adjustInk(m.image, opts);
+    origin = { x: (crop ? crop.x : 0) + m.offsetX, y: (crop ? crop.y : 0) + m.offsetY };
+    let left = 0;
+    for (let y = 0; y < m.height; y++) for (let x = 0; x < m.width; x++) {
+      const i = (y * m.width + x) * 4;
+      if (mask && !mask[(y + origin.y) * source.width + x + origin.x]) preview.data[i + 3] = 0;
+      if (preview.data[i + 3]) left++;
+    }
+    outCanvas.width = m.width; outCanvas.height = m.height;
+    outCanvas.getContext('2d').putImageData(preview, 0, 0);
+    result = (m.empty || !left) ? null : { data: outCanvas.toDataURL('image/png'), width: m.width, height: m.height };
+    sizeOut();
+    saveBtn.disabled = !result;
+    undoErase.disabled = !strokes.length;
+    restoreInk.disabled = !erased;
+    status.textContent = m.empty ? 'No ink found. Lower the paper cleanup, or try a clearer photo.'
+      : !left ? 'Everything has been erased. Undo a stroke, or restore the ink.'
+      : erasing ? 'Brush over anything that should not be there.'
+      : 'Paper removed, ink colour kept. ' + m.width + ' × ' + m.height + ' px.';
+  }
+
+  function sizeOut() {
+    const z = zoom.value === 'fit'
+      ? Math.min(1, (outWrap.clientWidth - 28) / Math.max(1, outCanvas.width), (outWrap.clientHeight - 28) / Math.max(1, outCanvas.height))
+      : +zoom.value;
+    outCanvas.style.width = Math.max(1, outCanvas.width * z) + 'px';
+    outCanvas.style.height = Math.max(1, outCanvas.height * z) + 'px';
+  }
+
+  /* ---- cropping ---- */
+  srcWrap.addEventListener('pointerdown', e => {
+    if (!source || e.button !== 0) return;
+    e.preventDefault();
+    const bounds = srcCanvas.getBoundingClientRect(), wrap = srcWrap.getBoundingClientRect();
+    const at = ev => ({ x: clamp((ev.clientX - bounds.left) / bounds.width, 0, 1), y: clamp((ev.clientY - bounds.top) / bounds.height, 0, 1) });
+    const a = at(e);
+    let b = a;
+    const show = () => {
+      const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y), w = Math.abs(b.x - a.x), hh = Math.abs(b.y - a.y);
+      Object.assign(cropBox.style, {
+        left: (bounds.left - wrap.left + x * bounds.width) + 'px',
+        top: (bounds.top - wrap.top + y * bounds.height) + 'px',
+        width: (w * bounds.width) + 'px', height: (hh * bounds.height) + 'px'
+      });
+      cropBox.hidden = false;
+    };
+    captureGesture(srcWrap, e, {
+      move: ev => { b = at(ev); show(); },
+      end: ev => {
+        b = at(ev);
+        if (Math.abs(b.x - a.x) * bounds.width < 8 || Math.abs(b.y - a.y) * bounds.height < 8) { cropBox.hidden = true; return; }
+        const x = Math.floor(Math.min(a.x, b.x) * source.width), y = Math.floor(Math.min(a.y, b.y) * source.height);
+        crop = {
+          x, y,
+          width: Math.max(1, Math.min(source.width - x, Math.round(Math.abs(b.x - a.x) * source.width))),
+          height: Math.max(1, Math.min(source.height - y, Math.round(Math.abs(b.y - a.y) * source.height)))
+        };
+        show(); resetCrop.hidden = false; run();
+      },
+      cancel: () => { cropBox.hidden = true; }
+    });
+  });
+
+  /* ---- the eraser ---- */
+  function toggleEraser() {
+    erasing = !erasing;
+    eraseBtn.setAttribute('aria-pressed', String(erasing));
+    outWrap.classList.toggle('erasing', erasing);
+    brush.hidden = true;
+    run();
+  }
+  function popStroke() {
+    if (!strokes.length || !mask) return;
+    const s = strokes.pop();
+    for (const i of s) mask[i] = 255;
+    erased -= s.length;
+    run();
+  }
+  outCanvas.addEventListener('pointermove', e => {
+    if (!erasing || !preview) return;
+    const r = outCanvas.getBoundingClientRect(), host = outWrap.getBoundingClientRect();
+    const d = Math.max(2, +brushSize.value * r.width / Math.max(1, outCanvas.width));
+    Object.assign(brush.style, { left: (e.clientX - host.left + outWrap.scrollLeft) + 'px', top: (e.clientY - host.top + outWrap.scrollTop) + 'px', width: d + 'px', height: d + 'px' });
+    brush.hidden = false;
+  });
+  outCanvas.addEventListener('pointerleave', () => { brush.hidden = true; });
+  outCanvas.addEventListener('pointerdown', e => {
+    if (!erasing || !mask || !preview || e.button !== 0) return;
+    e.preventDefault();
+    const rect = outCanvas.getBoundingClientRect();
+    const at = ev => ({ x: (ev.clientX - rect.left) / rect.width * outCanvas.width, y: (ev.clientY - rect.top) / rect.height * outCanvas.height });
+    const radius = +brushSize.value / 2, touched = new Set();
+    let last = at(e);
+    const dab = p => {
+      const x0 = Math.max(0, Math.floor(p.x - radius)), x1 = Math.min(outCanvas.width - 1, Math.ceil(p.x + radius));
+      const y0 = Math.max(0, Math.floor(p.y - radius)), y1 = Math.min(outCanvas.height - 1, Math.ceil(p.y + radius));
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+        if (radius > 0.5 && (x + 0.5 - p.x) ** 2 + (y + 0.5 - p.y) ** 2 > radius * radius) continue;
+        if (radius <= 0.5 && (x !== Math.floor(p.x) || y !== Math.floor(p.y))) continue;
+        const i = (y + origin.y) * source.width + x + origin.x;
+        if (mask[i]) { touched.add(i); mask[i] = 0; erased++; }
+        preview.data[(y * outCanvas.width + x) * 4 + 3] = 0;
+      }
+    };
+    dab(last);
+    captureGesture(outCanvas, e, {
+      move: ev => {
+        const p = at(ev);
+        const steps = Math.max(1, Math.ceil(Math.hypot(p.x - last.x, p.y - last.y) / Math.max(0.5, radius / 2)));
+        for (let j = 1; j <= steps; j++) dab({ x: last.x + (p.x - last.x) * j / steps, y: last.y + (p.y - last.y) * j / steps });
+        last = p;
+        if (!frame) frame = requestAnimationFrame(() => { outCanvas.getContext('2d').putImageData(preview, 0, 0); frame = null; });
+      },
+      end: () => {
+        if (frame) { cancelAnimationFrame(frame); frame = null; }
+        if (touched.size) { strokes.push(Uint32Array.from(touched)); if (strokes.length > 25) strokes.shift(); }
+        brush.hidden = true;
+        run();
+      }
+    });
+  });
+
+  /* ---- saving ---- */
+  async function save() {
+    clearTimeout(timer);
+    run();
+    if (!result) return;
+    const asset = {
+      id: uid(), kind: inkKind, created: Date.now(),
+      name: nameField.value.trim() || defaultName(),
+      data: result.data, width: result.width, height: result.height
+    };
+    saveBtn.disabled = true;
+    try { await inkStore('put', asset); }
+    catch (e) {
+      asset.sessionOnly = true;
+      toast('Saved for this session only — this browser will not keep it.', true);
+    }
+    S.ink = (S.ink || []).concat([asset]);
+    if (close) close();
+    toast((inkKind === 'stamp' ? 'Stamp' : 'Signature') + ' saved. Tap it in the panel to place it.');
+    if (onSaved) onSaved(asset);
+  }
+}
+
+/* A way in for the test harness, and only when it is asked for. The probes
+   drive the real interface, which is how a test should work, but a handful of
+   these helpers — wrapping, range parsing, the rubber's geometry — are worth
+   checking directly rather than through six layers of pointer events. Nothing
+   is exposed unless the page is opened with ?selftest=1. */
+try {
+  if (/[?&]selftest=1(?:&|$)/.test(location.search)) {
+    window.__paperless = Object.freeze({
+      wrapText, parseRanges, splitInk, underRubber, rubberHitsBox, boxDist,
+      shapeBox, textLines, textHeight, cssFilter, toBlobOrThrow, pageCrop,
+      baselineEm, inkRuns, state: S,
+      removePaper, adjustInk, inkStore, loadInkLibrary, inkBytes
+    });
+  }
+} catch (e) {}
+
+/* the saved ink library, read once at start-up */
+loadInkLibrary().catch(() => {});
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
